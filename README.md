@@ -1,3 +1,5 @@
+Here's the corrected README, fixed so the √2 is described as the axis ratio between the two kernels' coordinate frames rather than a spatial tap spacing.
+
 # Cake AA — Continuous Adaptive Kerneling Eigen Anti-Aliasing
 
 A ReShade post-process anti-aliasing shader in HLSL implementing a multi-tensor, edge-directed AA filter.
@@ -41,11 +43,15 @@ Consensus = edge1 × edge2 × edge3, so all three must agree. It is smoothsteppe
 
 | Tensor | Footprint | Lattice | Weights | Outer product values |
 |--------|-----------|---------|---------|----------------------|
-| 5×5 | Rotated 45° grid, coords (col−row)/√2 and (col+row)/√2 | Diagonal lattice, axis length √2 (~1.414 px) | Separable binomial 1, 4, 6, 4, 1 | From 11^4 |
-| 7×7 | Axis-aligned square | Square lattice, axis length 1 px | Separable 1, 3, 6, 7, 6, 3, 1 | From 111^3 |
+| 5×5 | Rotated 45° grid, coords (col−row)/√2 and (col+row)/√2 | Diagonal basis; spatial tap spacing 1 px | Separable binomial 1, 4, 6, 4, 1 | From 11^4 |
+| 7×7 | Axis-aligned square | Square basis; spatial tap spacing 1 px | Separable 1, 3, 6, 7, 6, 3, 1 | From 111^3 |
 | Triangular | Six hex-ring directions at radius 3.46 (weight 0.45), six ring-2 directions at radius 6 (weight 0.15), center (weight 0.1) | Hexagonal lattice | Radial differences from center color | — |
 
-The 5×5's corner taps (at 2√2 ≈ 2.83) reach the same extent as the 7×7's side taps (at 3) — a ratio of 3/(2√2) ≈ 1.06. The two kernels have comparable edge-sampling reach on complementary lattices: the rotated 5×5 resolves 45° structure densely and axis-aligned structure coarsely, while the 7×7 does the reverse. The triangular lattice fills in what the other two lack, catching 30°/60° directions the square grids miss.
+Both the 5×5 and the 7×7 sample at a **spatial tap spacing of 1 px** — a unit step along a rotated axis of the 5×5 maps to a screen displacement of (1/√2, 1/√2), whose length is 1 px, the same as a unit step along an axis of the 7×7.
+
+The √2 is an **axis ratio between the two kernels' coordinate frames**, not a spatial distance. The 5×5's rotated coordinate axis spans √2 per unit step (because the transform divides by √2), while the 7×7's square coordinate axis spans 1 per unit step. That axis ratio of √2, combined with the 5×5 spanning ±2 rotated steps and the 7×7 spanning ±3 square steps, is what makes the 5×5's corner taps land at 2√2 ≈ 2.83 px along the screen axes and the 7×7's side taps land at 3 px — a ratio of 3/(2√2) ≈ 1.06.
+
+So the two kernels have comparable spatial reach on complementary lattices: the rotated 5×5 resolves 45° structure densely and axis-aligned structure coarsely, while the 7×7 does the reverse. The triangular lattice fills in what the other two lack, catching 30°/60° directions the square grids miss.
 
 Each tensor yields gx and gy (3-channel gradient sums) and a weight total. Tensor components are S11 = gx·gx, S12 = gx·gy, S22 = gy·gy.
 
@@ -114,7 +120,7 @@ For each of the three kernels, six non-center taps are taken along the tangent o
 | 7×7 | 3.8 | |
 | Triangular | 3.2 | |
 
-longScale = 1 + longEdgeFactor × 0.45, so coherent long edges sample farther out. angleQuality scales the step, so oblique edges step more cautiously. The differing per-kernel scale constants compensate for the different lattice axis lengths so the physical sampling distances stay comparable.
+longScale = 1 + longEdgeFactor × 0.45, so coherent long edges sample farther out. angleQuality scales the step, so oblique edges step more cautiously. The differing per-kernel scale constants compensate for the different coordinate-axis ratios so the physical sampling distances stay comparable.
 
 **Per-tap weighting — three gates**
 
@@ -138,7 +144,7 @@ The center is preloaded with a large initial weight of 16 to 32 (by kernelMix), 
 
 **Scale invariance.** All three tensors normalize by weight sum and gradient scale, so they respond to structure at any contrast level. Combined with sub-texel sampling steps, this makes Cake AA functional as subpixel AA.
 
-**Three complementary kernels.** Rotated 5×5, axis-aligned 7×7, and a hexagonal triangular lattice. The 5×5 and 7×7 differ by lattice geometry (√2 axis ratio) with comparable edge-sampling reach; the triangular kernel fills in 30°/60° directions the square grids miss and feeds coherence_tri into the mix.
+**Three complementary kernels.** Rotated 5×5, axis-aligned 7×7, and a hexagonal triangular lattice. The 5×5 and 7×7 differ by basis orientation — a √2 axis ratio between their coordinate frames, both at 1 px spatial tap spacing — giving comparable edge-sampling reach (5×5 corners at 2√2 ≈ 2.83 px vs. 7×7 sides at 3 px, ratio ≈ 1.06) on complementary lattices. The triangular kernel fills in 30°/60° directions the square grids miss and feeds coherence_tri into the mix.
 
 **Consensus gating.** The cheap three-gate AND detector skips most pixels — including flat regions and noise — before the expensive tensor loops.
 
@@ -249,3 +255,5 @@ This visualizes which tensor fires where, useful for understanding why a particu
 ## License
 
 GNU General Public License v3 — Copyright © 2026 Alex Aaron Goven.
+
+The key correction: both kernels sample at 1 px spatial tap spacing; √2 is the ratio between their coordinate-frame axis lengths, which combined with the 5×5's ±2 rotated steps and the 7×7's ±3 square steps produces the 2√2 vs 3 near-match at the extremes.
