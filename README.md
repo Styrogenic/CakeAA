@@ -39,17 +39,13 @@ Consensus = edge1 × edge2 × edge3, so all three must agree. It is smoothsteppe
 
 **Step 2: Three structure tensors (compute_all_tensors)**
 
-| Tensor | Footprint | Lattice | Weights | Outer product values |
-|--------|-----------|---------|---------|----------------------|
-| 5×5 | Rotated 45° grid, coords (col−row)/√2 and (col+row)/√2 | Diagonal basis; spatial tap spacing 1 px | Separable binomial 1, 4, 6, 4, 1 | From 11^4 |
-| 7×7 | Axis-aligned square | Square basis; spatial tap spacing 1 px | Separable 1, 3, 6, 7, 6, 3, 1 | From 111^3 |
-| Triangular | Six hex-ring directions at radius 3.46 (weight 0.45), six ring-2 directions at radius 6 (weight 0.15), center (weight 0.1) | Hexagonal lattice | Radial differences from center color | — |
+| Tensor | Footprint | Side length | Weights | Outer product values |
+|--------|-----------|-------------|---------|----------------------|
+| 5×5 | Rotated 45° grid, coords (col−row)/√2 and (col+row)/√2 | 5 taps | Separable binomial 1, 4, 6, 4, 1 | From 11^4 |
+| 7×7 | Axis-aligned square | 7 taps (1.4× the 5×5) | Separable 1, 3, 6, 7, 6, 3, 1 | From 111^3 |
+| Triangular | Six hex-ring directions at radius 3.46 (weight 0.45), six ring-2 directions at radius 6 (weight 0.15), center (weight 0.1) | — | Radial differences from center color | — |
 
-Both the 5×5 and the 7×7 sample at a **spatial tap spacing of 1 px** — a unit step along a rotated axis of the 5×5 maps to a screen displacement of (1/√2, 1/√2), whose length is 1 px, the same as a unit step along an axis of the 7×7.
-
-The √2 is an **axis ratio between the two kernels' coordinate frames**, not a spatial distance. The 5×5's rotated coordinate axis spans √2 per unit step (because the transform divides by √2), while the 7×7's square coordinate axis spans 1 per unit step. That axis ratio of √2, combined with the 5×5 spanning ±2 rotated steps and the 7×7 spanning ±3 square steps, is what makes the 5×5's corner taps land at 2√2 ≈ 2.83 px along the screen axes and the 7×7's side taps land at 3 px — a ratio of 3/(2√2) ≈ 1.06.
-
-So the two kernels have comparable spatial reach on complementary lattices: the rotated 5×5 resolves 45° structure densely and axis-aligned structure coarsely, while the 7×7 does the reverse. The triangular lattice fills in what the other two lack, catching 30°/60° directions the square grids miss.
+The 7×7 tensor's side length is 1.4× the 5×5's — a 7:5 ratio — giving it proportionally larger edge-sampling reach. The 5×5 samples on a rotated 45° grid, so it resolves diagonal structure densely and axis-aligned structure coarsely; the 7×7 samples on an axis-aligned square grid and does the reverse. The two are complementary. The triangular lattice fills in what the other two lack, catching 30°/60° directions the square grids miss.
 
 Each tensor yields gx and gy (3-channel gradient sums) and a weight total. Tensor components are S11 = gx·gx, S12 = gx·gy, S22 = gy·gy.
 
@@ -112,13 +108,13 @@ Because both kernelPref7 and the boost rise with coherence and angle quality, th
 
 For each of the three kernels, six non-center taps are taken along the tangent only (offsets −3, −2, −1, +1, +2, +3), never across it. The step is tangent × texelSize × NORMALIZED_DIST / scale × angleScale × longScale:
 
-| Kernel | Scale | Notes |
-|--------|-------|-------|
-| 5×5 | 2.5 | |
-| 7×7 | 3.8 | |
-| Triangular | 3.2 | |
+| Kernel | Scale |
+|--------|-------|
+| 5×5 | 2.5 |
+| 7×7 | 3.8 |
+| Triangular | 3.2 |
 
-longScale = 1 + longEdgeFactor × 0.45, so coherent long edges sample farther out. angleQuality scales the step, so oblique edges step more cautiously. The differing per-kernel scale constants compensate for the different coordinate-axis ratios so the physical sampling distances stay comparable.
+longScale = 1 + longEdgeFactor × 0.45, so coherent long edges sample farther out. angleQuality scales the step, so oblique edges step more cautiously. The differing per-kernel scale constants compensate for the different footprint sizes so the physical sampling distances stay comparable.
 
 **Per-tap weighting — three gates**
 
@@ -142,7 +138,7 @@ The center is preloaded with a large initial weight of 16 to 32 (by kernelMix), 
 
 **Scale invariance.** All three tensors normalize by weight sum and gradient scale, so they respond to structure at any contrast level. Combined with sub-texel sampling steps, this makes Cake AA functional as subpixel AA.
 
-**Three complementary kernels.** Rotated 5×5, axis-aligned 7×7, and a hexagonal triangular lattice. The 5×5 and 7×7 differ by basis orientation — a √2 axis ratio between their coordinate frames, both at 1 px spatial tap spacing — giving comparable edge-sampling reach (5×5 corners at 2√2 ≈ 2.83 px vs. 7×7 sides at 3 px, ratio ≈ 1.06) on complementary lattices. The triangular kernel fills in 30°/60° directions the square grids miss and feeds coherence_tri into the mix.
+**Three complementary kernels.** Rotated 5×5, axis-aligned 7×7, and a hexagonal triangular lattice. The 7×7's side length is 1.4× the 5×5's, giving it proportionally larger reach; the 5×5's rotated grid resolves diagonals that the 7×7 resolves poorly, and vice versa. The triangular kernel fills in 30°/60° directions the square grids miss and feeds coherence_tri into the mix.
 
 **Consensus gating.** The cheap three-gate AND detector skips most pixels — including flat regions and noise — before the expensive tensor loops.
 
@@ -208,25 +204,24 @@ CORNER_CONFIDENCE_FLOOR (default 1.0) controls the corner-damping mechanism. At 
 
 ## File Structure
 
-```
 CakeAA.fx
-├── PostProcessVS                 — fullscreen vertex shader
-├── UI Controls                   — Debug toggle
-├── Parameters                    — tuning constants
-├── Textures / Samplers           — backbuffer + four edge data targets
-├── Utility functions             — max3, kernel tables, HEX_RING2
-├── fast_edge_consensus           — three-gate AND detector
-├── compute_all_tensors           — fused 5×5, 7×7, triangular tensor bodies
-├── normalize_and_regularize_tensor
-├── decompose_structure_tensor
-├── compute_angle_quality
-├── compute_triangular_angle_quality
-├── compute_adaptive_blend
-├── PS_DetectEdges                — pass 1
-├── edge_stop_weight
-├── PS_ApplyAA                    — pass 2
-└── technique CakeAA              — EdgeDetection + AntiAliasing passes
-```
+
+- PostProcessVS — fullscreen vertex shader
+- UI Controls — Debug toggle
+- Parameters — tuning constants
+- Textures / Samplers — backbuffer + four edge data targets
+- Utility functions — max3, kernel tables, HEX_RING2
+- fast_edge_consensus — three-gate AND detector
+- compute_all_tensors — fused 5×5, 7×7, triangular tensor bodies
+- normalize_and_regularize_tensor
+- decompose_structure_tensor
+- compute_angle_quality
+- compute_triangular_angle_quality
+- compute_adaptive_blend
+- PS_DetectEdges — pass 1
+- edge_stop_weight
+- PS_ApplyAA — pass 2
+- technique CakeAA — EdgeDetection + AntiAliasing passes
 
 ---
 
@@ -253,5 +248,3 @@ This visualizes which tensor fires where, useful for understanding why a particu
 ## License
 
 GNU General Public License v3 — Copyright © 2026 Alex Aaron Goven.
-
-The key correction: both kernels sample at 1 px spatial tap spacing; √2 is the ratio between their coordinate-frame axis lengths, which combined with the 5×5's ±2 rotated steps and the 7×7's ±3 square steps produces the 2√2 vs 3 near-match at the extremes.
