@@ -150,6 +150,27 @@ The center is preloaded with a large initial weight of 16 to 32 (by kernelMix), 
 
 ---
 
+## The Triangular Lattice as a Disagreement Signal
+
+The triangular kernel is often described as an oblique-direction resolver — it catches 30°/60° structure the square grids miss. That's true, but there's a second, arguably more important role it plays: it provides a **geometrically independent second opinion on coherence**, and disagreement between that opinion and the 7×7's is itself useful information.
+
+Consensus (the three-gate AND pre-filter) is the hard early-exit: pixels that fail Sobel, axial jump, or diagonal jump are skipped entirely before any tensor math runs. The triangular kernel does not feed any of those three gates, so it cannot trigger that hard early-out.
+
+What it does do is produce a fourth independent read on the local structure. `coherence_tri = (λ1_tri − λ2_tri) / (λ1_tri + λ2_tri)` is computed from a hexagonal lattice with different sampling geometry than either square grid. When the 7×7 and the tri tensor agree that a pixel is coherent, that pixel is a confident edge. When they disagree — 7×7 says coherent, tri says incoherent, or vice versa — the magnitude of the disagreement is itself a signal about how reliable the local tangent estimate is.
+
+That signal is used in two places:
+
+1. **`longEdgeFactor = max(coherence_7, coherence_tri × 0.85)`** — the tri tensor can promote a pixel to "long edge" that the 7×7 alone would under-rate, because hexagonal sampling sometimes sees coherent structure along 30°/60° that the square lattice reads as low-coherence.
+2. **`kernelMix` gets `+ coherence_tri × 0.15`** — a tri-coherent pixel pushes the mix toward the long 7×7 kernel.
+
+The practical effect is a **soft early-out by weighting rather than branching**: low `coherence_tri` pulls `longEdgeFactor` down when `coherence_7` is already low, which drops `blend` and reduces `kernelMix`, so the filter does less work on pixels where the tensors collectively disagree about whether there's a clean edge. The pixel isn't skipped — it's just treated conservatively.
+
+This is why removing the triangular lattice costs more than just 30°/60° direction coverage. Without it, `longEdgeFactor = coherence_7` alone, and a pixel the 7×7 misreads — coherent when it's actually a corner, or incoherent when it's actually a clean oblique edge — gets no cross-check. The tri kernel's value is not only directional coverage; it is the cross-check itself.
+
+A harder version of this idea would be an explicit early-exit in pass 2, e.g. returning `centerColor` when `min(coherence_7, coherence_tri) < 0.1` and `angleQuality < 0.5`. The current shader does not do this — the behavior is the softer weighting described above — but the disagreement signal is there for anyone who wants to make it explicit.
+
+---
+
 ## Oblique-Aware Tuning
 
 The default parameters include several oblique-specific adjustments:
