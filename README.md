@@ -1,5 +1,3 @@
-Here's the corrected README, fixed so the √2 is described as the axis ratio between the two kernels' coordinate frames rather than a spatial tap spacing.
-
 # Cake AA — Continuous Adaptive Kerneling Eigen Anti-Aliasing
 
 A ReShade post-process anti-aliasing shader in HLSL implementing a multi-tensor, edge-directed AA filter.
