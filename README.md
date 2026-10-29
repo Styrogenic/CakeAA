@@ -2,7 +2,7 @@
 
 A ReShade post-process anti-aliasing shader in HLSL implementing a multi-tensor, edge-directed AA filter.
 
-It detects edges, builds three local gradient tensors with different footprints, then blurs **along** edges — never across them — with per-pixel strength and kernel selection driven by edge confidence.
+It detects edges, builds local gradient tensors with different footprints, then blurs **along** edges — never across them — with per-pixel strength and kernel selection driven by edge confidence.
 
 - **Author:** Alex Aaron Goven
 - **Copyright © 2026**
@@ -14,7 +14,7 @@ It detects edges, builds three local gradient tensors with different footprints,
 
 Cake AA is a two-pass filter:
 
-1. **EdgeDetection** — writes four RGBA16F render targets containing tensor strengths, tangents, coherence, and angle quality.
+1. **EdgeDetection** — writes RGBA16F render targets containing tensor strengths, tangents, coherence, and angle quality.
 2. **AntiAliasing** — reads those targets plus the backbuffer and blends in an edge-directed average.
 
 The filter never samples perpendicular to the local edge, so it smooths along edges rather than across them.
@@ -27,7 +27,7 @@ The filter never samples perpendicular to the local edge, so it smooths along ed
 
 **Step 1: Consensus pre-filter (fast_edge_consensus)**
 
-A cheap three-gate AND detector decides whether a pixel is worth the expensive tensor math. If consensus is below 0.1, all four outputs are zeroed and the pixel exits early.
+A cheap three-gate AND detector decides whether a pixel is worth the expensive tensor math. If consensus is below 0.1, all outputs are zeroed and the pixel exits early.
 
 | Gate | Signal | Notes |
 |------|--------|-------|
@@ -35,23 +35,22 @@ A cheap three-gate AND detector decides whether a pixel is worth the expensive t
 | 2 | Axial jump | Max per-channel color difference between center and its four axial 1px neighbors — chroma-aware |
 | 3 | Diagonal jump | Same for the four diagonal 1px neighbors |
 
-Consensus = edge1 × edge2 × edge3, so all three must agree. It is smoothstepped around a cubed threshold and scaled by a smoothstep on the max of the three to suppress weak edges. This kills flat regions and isolated single-pixel noise before the 25 + 49 + 12 tap tensor loops run.
+Consensus = edge1 × edge2 × edge3, so all three must agree. It is smoothstepped around a cubed threshold and scaled by a smoothstep on the max of the three to suppress weak edges. This kills flat regions and isolated single-pixel noise before the tensor loops run.
 
-**Step 2: Three structure tensors (compute_all_tensors)**
+**Step 2: Structure tensors (compute_all_tensors)**
 
 | Tensor | Footprint | Side length | Weights | Outer product values |
 |--------|-----------|-------------|---------|----------------------|
 | 5×5 | Rotated 45° grid, coords (col−row)/√2 and (col+row)/√2 | 5 taps | Separable binomial 1, 4, 6, 4, 1 | From 11^4 |
 | 7×7 | Axis-aligned square | 7 taps (1.4× the 5×5) | Separable 1, 3, 6, 7, 6, 3, 1 | From 111^3 |
-| Triangular | Six hex-ring directions at radius 3.46 (weight 0.45), six ring-2 directions at radius 6 (weight 0.15), center (weight 0.1) | — | Radial differences from center color | — |
 
-The 7×7 tensor's side length is 1.4× the 5×5's — a 7:5 ratio — giving it proportionally larger edge-sampling reach. The 5×5 samples on a rotated 45° grid, so it resolves diagonal structure densely and axis-aligned structure coarsely; the 7×7 samples on an axis-aligned square grid and does the reverse. The two are complementary. The triangular lattice fills in what the other two lack, catching 30°/60° directions the square grids miss.
+The 7×7 tensor's side length is 1.4× the 5×5's — a 7:5 ratio — giving it proportionally larger edge-sampling reach. The 5×5 samples on a rotated 45° grid, so it resolves diagonal structure densely and axis-aligned structure coarsely; the 7×7 samples on an axis-aligned square grid and does the reverse. The two are complementary.
 
 Each tensor yields gx and gy (3-channel gradient sums) and a weight total. Tensor components are S11 = gx·gx, S12 = gx·gy, S22 = gy·gy.
 
 **Step 3: Normalize and regularize**
 
-normalize_and_regularize_tensor divides by weight sum, adds epsilon to the diagonal, and divides by gradientScale² (2.0, 3.0, 3.0). This makes the tensors scale-invariant, so they respond to relative structure rather than absolute brightness — suited to HDR and game content, and functional as subpixel AA.
+normalize_and_regularize_tensor divides by weight sum, adds epsilon to the diagonal, and divides by gradientScale² (2.0, 3.0). This makes the tensors scale-invariant, so they respond to relative structure rather than absolute brightness — suited to HDR and game content, and functional as subpixel AA.
 
 **Step 4: Eigendecomposition**
 
@@ -68,14 +67,11 @@ Derived quantities:
 | meanGradMag | √(λ1 + λ2) | Gradient magnitude |
 | strength | meanGradMag / (meanGradMag + knee) | Edge strength, with adaptive knee = RELATIVE_KNEE × max(centerLum, 0.02) |
 | coherence | (λ1 − λ2) / (λ1 + λ2) | Edge-like vs. corner-like |
-| longEdgeFactor | max(coherence_7, coherence_tri × 0.85) | Confidence this is a long edge rather than a corner |
+| longEdgeFactor | coherence_7 | Confidence this is a long edge rather than a corner |
 
 **Step 5: Angle quality**
 
-- compute_angle_quality rewards tangents aligned to image axes or 45° diagonals, boosting oblique angles toward 1.0.
-- compute_triangular_angle_quality rewards alignment to 30°/60° hexagonal axes, blended by coherence.
-
-The two are mixed by TRIANGULAR_WEIGHT = 0.45 into a single angleQuality.
+compute_angle_quality rewards tangents aligned to image axes or 45° diagonals, boosting oblique angles toward 1.0.
 
 **Outputs**
 
@@ -83,16 +79,16 @@ The two are mixed by TRIANGULAR_WEIGHT = 0.45 into a single angleQuality.
 |--------|---|---|---|---|
 | EdgeDataTex0 | strength5 | strength7 | angleQuality | consensus |
 | EdgeDataTex1 | tangent5.x | tangent5.y | tangent7.x | tangent7.y |
-| EdgeDataTex2 | strength_tri | λ1_tri | λ2_tri | coherence_tri |
-| EdgeDataTex3 | tangent_tri.x | tangent_tri.y | longEdgeFactor | 0 |
+| EdgeDataTex2 | coherence_7 | 0 | 0 | 0 |
+| EdgeDataTex3 | 0 | 0 | 0 | 0 |
 
 ### Pass 2 — Anti-Aliasing (PS_ApplyAA)
 
-**Debug view:** if Debug is on, output is strength5 / strength_tri / strength7 in R / G / B, visualizing which tensor fires where.
+**Debug view:** if Debug is on, output is strength5 in R and strength7 in B, visualizing which tensor fires where.
 
 **Adaptive blend strength (compute_adaptive_blend)**
 
-Combines the three strengths via RMS, the max of longEdgeFactor and coherence_tri, and angleQuality into a per-pixel blend amount. Stronger edges produce more blend; high coherence produces a coherenceBoost.
+Combines the two strengths via RMS, coherence_7, and angleQuality into a per-pixel blend amount. Stronger edges produce more blend; high coherence produces a coherenceBoost.
 
 **Corner damping** — structureConfidence = lerp(CORNER_CONFIDENCE_FLOOR, 1.0, coherence) multiplies strengthQuality. The floor sets the confidence multiplier at zero coherence, scaling up with coherence, so corner-like pixels get reduced overall blend, preventing corner smearing and junction blow-outs. **This build ships with CORNER_CONFIDENCE_FLOOR = 1.0, which neutralizes the mechanism at the default; lowering the floor re-enables it.**
 
@@ -100,19 +96,18 @@ Very weak edges (edgeStrength < 0.1) are pulled toward 0.1 and very strong edges
 
 **Kernel mix**
 
-kernelPref7 = strength7 / (strength5 + strength7 + strength_tri), boosted by longEdgeFactor × angleQuality and coherence_tri × 0.15, then smoothstepped. Confident long edges get the long 7×7 kernel; short and fine features get the 5×5.
+kernelPref7 = strength7 / (strength5 + strength7), boosted by longEdgeFactor × angleQuality, then smoothstepped. Confident long edges get the long 7×7 kernel; short and fine features get the 5×5.
 
-Because both kernelPref7 and the boost rise with coherence and angle quality, the 7×7 gets more attention as an edge becomes longer and more coherent; the 5×5 is the sharper, diagonal fallback for short and fine features. An oblique bias additionally pulls kernelMix toward the 5×5 when angleQuality < 0.7 and coherence_tri < 0.5, using the rotated diagonal lattice for its geometric purpose.
+Because both kernelPref7 and the boost rise with coherence and angle quality, the 7×7 gets more attention as an edge becomes longer and more coherent; the 5×5 is the sharper, diagonal fallback for short and fine features. An oblique bias additionally pulls kernelMix toward the 5×5 when angleQuality < 0.7 and coherence_7 < 0.5, using the rotated diagonal lattice for its geometric purpose.
 
 **Along-tangent taps**
 
-For each of the three kernels, six non-center taps are taken along the tangent only (offsets −3, −2, −1, +1, +2, +3), never across it. The step is tangent × texelSize × NORMALIZED_DIST / scale × angleScale × longScale:
+For each kernel, six non-center taps are taken along the tangent only (offsets −3, −2, −1, +1, +2, +3), never across it. The step is tangent × texelSize × NORMALIZED_DIST / scale × angleScale × longScale:
 
 | Kernel | Scale |
 |--------|-------|
 | 5×5 | 2.5 |
 | 7×7 | 3.8 |
-| Triangular | 3.2 |
 
 longScale = 1 + longEdgeFactor × 0.45, so coherent long edges sample farther out. angleQuality scales the step, so oblique edges step more cautiously. The differing per-kernel scale constants compensate for the different footprint sizes so the physical sampling distances stay comparable.
 
@@ -122,7 +117,7 @@ Each tap weight is kernelWeight × dirWeight × stopWeight.
 
 | Gate | Formula | Purpose |
 |------|---------|---------|
-| Kernel weight | Radial falloff: 9/2 for 5×5, 24/12/3 for 7×7, 18/8/2 for triangular; scaled by kernelMix or triWeight | Tap falloff |
+| Kernel weight | Radial falloff: 9/2 for 5×5, 24/12/3 for 7×7; scaled by kernelMix | Tap falloff |
 | dirWeight | smoothstep(dirAlignMin, dirAlignMax, dot(centerTangent, sampleTangent)) | Down-weights neighbors whose tangent points differently — the primary guard against bleeding across edges and corners |
 | stopWeight | 1 / (1 + 2x²) where x = colorDiff × COLOR_SENSITIVITY, relaxed by sampleEdge | Suppresses taps with large color differences; relaxation prevents halos |
 
@@ -130,15 +125,15 @@ dirAlignMin is relaxed toward 0.55 on oblique edges (lerp(0.55, 0.7, angleQualit
 
 **Final blend**
 
-The center is preloaded with a large initial weight of 16 to 32 (by kernelMix), 24 at full tri weight, keeping the result near the original unless neighbors strongly agree. finalColor = acc / totalWeight, output = lerp(centerColor, finalColor, blend).
+The center is preloaded with a large initial weight of 16 to 32 (by kernelMix), keeping the result near the original unless neighbors strongly agree. finalColor = acc / totalWeight, output = lerp(centerColor, finalColor, blend).
 
 ---
 
 ## Key Design Choices
 
-**Scale invariance.** All three tensors normalize by weight sum and gradient scale, so they respond to structure at any contrast level. Combined with sub-texel sampling steps, this makes Cake AA functional as subpixel AA.
+**Scale invariance.** All tensors normalize by weight sum and gradient scale, so they respond to structure at any contrast level. Combined with sub-texel sampling steps, this makes Cake AA functional as subpixel AA.
 
-**Three complementary kernels.** Rotated 5×5, axis-aligned 7×7, and a hexagonal triangular lattice. The 7×7's side length is 1.4× the 5×5's, giving it proportionally larger reach; the 5×5's rotated grid resolves diagonals that the 7×7 resolves poorly, and vice versa. The triangular kernel fills in 30°/60° directions the square grids miss and feeds coherence_tri into the mix.
+**Two complementary kernels.** Rotated 5×5 and axis-aligned 7×7. The 7×7's side length is 1.4× the 5×5's, giving it proportionally larger reach; the 5×5's rotated grid resolves diagonals that the 7×7 resolves poorly, and vice versa.
 
 **Consensus gating.** The cheap three-gate AND detector skips most pixels — including flat regions and noise — before the expensive tensor loops.
 
@@ -150,27 +145,6 @@ The center is preloaded with a large initial weight of 16 to 32 (by kernelMix), 
 
 ---
 
-## The Triangular Lattice as a Disagreement Signal
-
-The triangular kernel is often described as an oblique-direction resolver — it catches 30°/60° structure the square grids miss. That's true, but there's a second, arguably more important role it plays: it provides a **geometrically independent second opinion on coherence**, and disagreement between that opinion and the 7×7's is itself useful information.
-
-Consensus (the three-gate AND pre-filter) is the hard early-exit: pixels that fail Sobel, axial jump, or diagonal jump are skipped entirely before any tensor math runs. The triangular kernel does not feed any of those three gates, so it cannot trigger that hard early-out.
-
-What it does do is produce a fourth independent read on the local structure. `coherence_tri = (λ1_tri − λ2_tri) / (λ1_tri + λ2_tri)` is computed from a hexagonal lattice with different sampling geometry than either square grid. When the 7×7 and the tri tensor agree that a pixel is coherent, that pixel is a confident edge. When they disagree — 7×7 says coherent, tri says incoherent, or vice versa — the magnitude of the disagreement is itself a signal about how reliable the local tangent estimate is.
-
-That signal is used in two places:
-
-1. **`longEdgeFactor = max(coherence_7, coherence_tri × 0.85)`** — the tri tensor can promote a pixel to "long edge" that the 7×7 alone would under-rate, because hexagonal sampling sometimes sees coherent structure along 30°/60° that the square lattice reads as low-coherence.
-2. **`kernelMix` gets `+ coherence_tri × 0.15`** — a tri-coherent pixel pushes the mix toward the long 7×7 kernel.
-
-The practical effect is a **soft early-out by weighting rather than branching**: low `coherence_tri` pulls `longEdgeFactor` down when `coherence_7` is already low, which drops `blend` and reduces `kernelMix`, so the filter does less work on pixels where the tensors collectively disagree about whether there's a clean edge. The pixel isn't skipped — it's just treated conservatively.
-
-This is why removing the triangular lattice costs more than just 30°/60° direction coverage. Without it, `longEdgeFactor = coherence_7` alone, and a pixel the 7×7 misreads — coherent when it's actually a corner, or incoherent when it's actually a clean oblique edge — gets no cross-check. The tri kernel's value is not only directional coverage; it is the cross-check itself.
-
-A harder version of this idea would be an explicit early-exit in pass 2, e.g. returning `centerColor` when `min(coherence_7, coherence_tri) < 0.1` and `angleQuality < 0.5`. The current shader does not do this — the behavior is the softer weighting described above — but the disagreement signal is there for anyone who wants to make it explicit.
-
----
-
 ## Oblique-Aware Tuning
 
 The default parameters include several oblique-specific adjustments:
@@ -178,7 +152,6 @@ The default parameters include several oblique-specific adjustments:
 | Parameter | Default | Effect |
 |-----------|---------|--------|
 | OBLIQUE_BLEND_FLOOR | 0.80 | Oblique edges retain more of their blend instead of being throttled to 0.6× |
-| TRI_KERNEL_PRESENCE | 0.75 | Raises the hexagonal kernel's effective tap weight from ~0.22 to ~0.34 |
 | OBLIQUE_DIRMIN_FLOOR | 0.55 | Widens the tangent-agreement window on oblique edges |
 | OBLIQUE_5X5_BIAS | 0.60 | Pulls kernelMix toward the rotated 5×5 on oblique edges with moderate coherence |
 
@@ -231,13 +204,12 @@ CakeAA.fx
 - UI Controls — Debug toggle
 - Parameters — tuning constants
 - Textures / Samplers — backbuffer + four edge data targets
-- Utility functions — max3, kernel tables, HEX_RING2
+- Utility functions — max3, kernel tables
 - fast_edge_consensus — three-gate AND detector
-- compute_all_tensors — fused 5×5, 7×7, triangular tensor bodies
+- compute_all_tensors — fused 5×5 and 7×7 tensor bodies
 - normalize_and_regularize_tensor
 - decompose_structure_tensor
 - compute_angle_quality
-- compute_triangular_angle_quality
 - compute_adaptive_blend
 - PS_DetectEdges — pass 1
 - edge_stop_weight
@@ -258,7 +230,6 @@ CakeAA.fx
 Enable the Debug checkbox in the UI. The output shows:
 
 - **R** = 5×5 strength
-- **G** = triangular strength
 - **B** = 7×7 strength
 - **Additive** — overlaps sum toward white on a black background
 
