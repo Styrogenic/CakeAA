@@ -161,6 +161,80 @@ These stay inside the tensor/blur paradigm — no pattern matching — and are i
 
 ---
 
+## Curve Formation
+
+This section documents how each curve in the shader is actually formed — which are derived, which are hand-tuned, and which are standard named curves.
+
+**Tensor weight curves**
+
+- **5×5:** `1, 4, 6, 4, 1` — Pascal's triangle, row 4, `C(4,k)`. Binomial. Row sum 16, outer product normalized by 16² = 256. The discrete binomial is the standard finite-difference approximation to a Gaussian.
+- **7×7:** `1, 3, 6, 7, 6, 3, 1` — a hand-selected symmetric, unimodal row. **Not** a Pascal row (row 6 is `1, 6, 15, 20, 15, 6, 1`). **Not** a Gaussian sample. Flatter and wider than Pascal's row 6, with a gentler peak-to-shoulder ratio and a deliberately softened center for the long-edge kernel role. Row sum 27, outer product normalized by 27² = 729.
+
+The `11^4` and `111^3` designations are the basis labels for the tensor weight structure. They are characterizations of the construction, not numeric sums of the rows or outer products — the 5×5 row sums to 16 and the 7×7 row sums to 27; the outer products sum to 256 and 729 respectively. The `11^4` and `111^3` naming captures the basis structure, not an arithmetic identity of the row entries.
+
+**Radial falloff curves (pass 2 tap weights)**
+
+- 5×5: `9, 9, 2` at |i| = 1, 2, 3
+- 7×7: `24, 12, 3` at |i| = 1, 2, 3
+
+These are separate from the tensor weights and are hand-tuned per tap offset. They are not from any named sequence; they were chosen so the tap loop's center-bias matches the kernel-mix intent.
+
+**Smoothstep curves**
+
+Standard Hermite cubic: `smoothstep(a, b, x) = t²(3 − 2t)` with `t = saturate((x − a)/(b − a))`. Used in four places, each with a different window `[a, b]`:
+- Consensus threshold softening
+- Minimum-edge floor
+- Direction alignment gate
+- Kernel mix
+
+**Rational edge-stop suppression**
+
+`1 / (1 + 2x²)` where `x = colorDiff × COLOR_SENSITIVITY`. Cauchy/Lorentzian-shaped: heavy-tailed compared to a Gaussian, so it never truly reaches zero — a tap with a moderately large color difference retains a small weight rather than being cut off sharply. The `lerp(..., 1.0, sampleEdge)` relaxation lets strong edges partially bypass the suppression.
+
+**Linear interpolation and adaptation curves**
+
+Standard `lerp(a, b, t) = a + (b − a)t`, plus linear tapers toward clamp endpoints for very weak and very strong edges. These are trivial interpolations; the endpoints are chosen per parameter.
+
+**Summary**
+
+| Curve | Formation method | Named ancestor? |
+|---|---|---|
+| 5×5 tensor weights | Pascal row 4, `C(4,k)` | Binomial |
+| 7×7 tensor weights | Hand-selected symmetric row | None (`111^3` is a basis label) |
+| 5×5 radial falloff | Hand-tuned `9, 9, 2` | None |
+| 7×7 radial falloff | Hand-tuned `24, 12, 3` | None |
+| Smoothstep gates | Hermite cubic `t²(3−2t)` | Standard smoothstep |
+| Edge-stop suppression | `1/(1+2x²)` | Lorentzian-like |
+| Blend/angle/dir lerps | Linear `a+(b−a)t` | Linear interpolation |
+| Adaptation clamps | Linear tapers to endpoints | None |
+
+The pattern across all of these: the tensor kernel rows are the only mathematically-derived curves (and only the 5×5 is a standard derivation; the 7×7 is chosen). Everything else is hand-tuned — either a custom profile, a named standard curve, or a linear taper.
+
+---
+
+## Originality
+
+Cake AA combines established mathematical components into a specific architecture that is not represented among existing ReShade anti-aliasing shaders. The distinction between what is novel and what is not is stated plainly.
+
+**Standard components** (not novel on their own):
+- Structure tensors for orientation analysis
+- Eigen-decomposition to find the edge tangent
+- Along-tangent (edge-directed) blurring
+- Post-process edge detection with blur
+- Binomial kernel weights
+- Smoothstep, lerp, and Lorentzian-shaped falloff curves
+
+**Novel to Cake AA** (the specific combination and structures):
+- **Consensus-gated dual-tensor detection** — a cheap three-gate AND pre-filter deciding whether a pixel is worth running *two different* tensor footprints on, with gate 1's distance-2 footprint chosen specifically to decorrelate it from the two 1px jump gates so the AND remains discriminating.
+- **Complementary lattice pairing** — a rotated 5×5 and an axis-aligned 7×7 tensor, using two lattice geometries (diagonal-dense vs. axis-dense) that cover complementary orientation families, arbitrated by a `kernelMix` driven by coherence and angle quality.
+- **Per-tap directional gating along a single tangent** — the `dirWeight × stopWeight` structure that samples only along the estimated edge, never across it, with direction-alignment and edge-stop as separate rejection gates.
+- **Oblique-aware tuning layer** — the `OBLIQUE_5X5_BIAS`, `OBLIQUE_DIRMIN_FLOOR`, and angle-quality-driven step scaling that specifically address the failure mode of oblique edges in a tensor-based blur.
+- **Tensor basis characterization** — the `11^4` and `111^3` naming of the tensor weight basis structures.
+
+The individual vocabulary is standard graphics mathematics. The sentence structure — the specific assembly of consensus gating, dual-tensor arbitration, and per-tap direction/stop gating in a ReShade post-process — is the novel contribution. This is architecture-level originality: a new arrangement of known primitives with a specific performance and quality trade-off, rather than a new mathematical primitive.
+
+---
+
 ## Stacking with Other AA
 
 Cake does not require SMAA or in-game non-temporal AA earlier in the pipeline, but pairing is beneficial in either of two ways:
