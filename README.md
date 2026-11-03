@@ -31,11 +31,13 @@ A cheap three-gate AND detector decides whether a pixel is worth the expensive t
 
 | Gate | Signal | Notes |
 |------|--------|-------|
-| 1 | Sobel magnitude | Per-channel Sobel on the 3×3 neighborhood, plus a luma term and a sparse 2px outer-ring gradient (N/S/E/W at distance 2) |
-| 2 | Axial jump | Max per-channel color difference between center and its four axial 1px neighbors — chroma-aware |
-| 3 | Diagonal jump | Same for the four diagonal 1px neighbors |
+| 1 | Distance-2 color jump | Max per-channel color difference between center and its eight distance-2 neighbors (4 axial + 4 diagonal) — chroma-aware |
+| 2 | 1px axial jump | Max per-channel color difference between center and its four axial 1px neighbors — chroma-aware |
+| 3 | 1px diagonal jump | Same for the four diagonal 1px neighbors |
 
 Consensus = edge1 × edge2 × edge3, so all three must agree. It is smoothstepped around a cubed threshold and scaled by a smoothstep on the max of the three to suppress weak edges. This kills flat regions and isolated single-pixel noise before the tensor loops run.
+
+Gate 1's distance-2 footprint decorrelates it from the two 1px jump gates, so the AND remains discriminating rather than collapsing into a single correlated test.
 
 **Step 2: Structure tensors (compute_all_tensors)**
 
@@ -135,7 +137,7 @@ The center is preloaded with a large initial weight of 16 to 32 (by kernelMix), 
 
 **Two complementary kernels.** Rotated 5×5 and axis-aligned 7×7. The 7×7's side length is 1.4× the 5×5's, giving it proportionally larger reach; the 5×5's rotated grid resolves diagonals that the 7×7 resolves poorly, and vice versa.
 
-**Consensus gating.** The cheap three-gate AND detector skips most pixels — including flat regions and noise — before the expensive tensor loops.
+**Consensus gating.** The cheap three-gate AND detector skips most pixels — including flat regions and noise — before the expensive tensor loops. Gate 1's distance-2 footprint keeps the AND discriminating.
 
 **Along-tangent-only blur.** The filter never samples perpendicular to the local edge, so it smooths along edges, not across them.
 
@@ -163,7 +165,7 @@ These stay inside the tensor/blur paradigm — no pattern matching — and are i
 
 Cake does not require SMAA or in-game non-temporal AA earlier in the pipeline, but pairing is beneficial in either of two ways:
 
-- **Post-process AA (SMAA preferred over FXAA for sharpness).** SMAA's pattern-based edge reconstruction preserves more detail and introduces less blur than FXAA's single-pass luma blur, so it can cover edge cases Cake would miss — very thin sub-pixel features below Cake's consensus gate, or edges whose chroma signature is too subtle for the jump gates even though the luma Sobel fires — without eroding sharpness.
+- **Post-process AA (SMAA preferred over FXAA for sharpness).** SMAA's pattern-based edge reconstruction preserves more detail and introduces less blur than FXAA's single-pass luma blur, so it can cover edge cases Cake would miss — very thin sub-pixel features below Cake's consensus gate, or edges whose chroma signature is too subtle for the jump gates — without eroding sharpness.
 - **Information-dense AA (MSAA, SSAA).** A cleaner, less aliased input with fewer spurious high-frequency edges means Cake's consensus pre-filter sees more genuine structure and less single-pixel noise, and its tensors resolve cleaner gradients.
 
 Either way, Cake's along-tangent-only, scale-invariant behavior composes well: it refines and extends whatever edge information the earlier stage leaves, rather than fighting it.
@@ -171,6 +173,21 @@ Either way, Cake's along-tangent-only, scale-invariant behavior composes well: i
 ---
 
 ## Tuning Notes
+
+### Edge sensitivity (gate 1)
+
+EDGE_SENSITIVITY (default 4.0) scales gate 1's distance-2 color jump. Higher values make gate 1 fire on smaller distance-2 color deltas.
+
+- Conservative: ~1.2–2.0
+- Aggressive: ~4.0–6.0
+- Above ~6.0, gate 1 saturates on most non-flat content and stops discriminating; the detector effectively becomes the two-gate AND
+
+### Consensus floor
+
+MIN_CONSENSUS_EDGE (default 0.10) gates the whole consensus on max(edge1, edge2, edge3). Lowering it admits pixels where all three gates are only moderately strong — the real lever for more sensitivity once gate 1 is near saturation.
+
+- Original: 0.15
+- Default: 0.10
 
 ### Color sensitivity
 
