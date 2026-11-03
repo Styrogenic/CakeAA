@@ -1,10 +1,11 @@
 //================================================================================================================================
 // Continuous Adaptive Kerneling Eigen AA (Cake AA) — SCALE-INVARIANT VERSION
 // OPTIMIZED WITH SMART CONSENSUS PRE-FILTERING
-// ALL THREE TENSORS ARE SCALE-INVARIANT (operate at all frequencies)
-// TWO-TENSOR BUILD: 5x5 + 7x7 (triangular lattice removed)
+// ALL TENSORS ARE SCALE-INVARIANT (operate at all frequencies)
+// TWO-TENSOR BUILD: 5x5 + 7x7
+// GATE 1 REPLACED: distance-2 color-jump instead of Sobel (no gradient vector needed by consensus)
 // OBLIQUE-AWARE TUNING (5x5 oblique bias, dirWeight relaxation)
-// BALANCED COLOR/JUMP SENSITIVITY
+// HIGH-SENSITIVITY DETECTION
 // Copyright © 2026 Alex Aaron Goven
 // License: GNU General Public License v3
 // CHROMA-AWARE NEARBY-ALIAS SENSITIVE CONSENSUS DETECTOR
@@ -50,13 +51,13 @@ uniform bool Debug <
 static const float  AA_STRENGTH          = 1.0f;
 static const float  RELATIVE_KNEE        = 0.005f;
 static const float  NORMALIZED_DIST      = 3.5f;
-static const float  COLOR_SENSITIVITY    = 7.0f;   // modest, safe edge-stop sensitivity
+static const float  COLOR_SENSITIVITY    = 7.0f;   // edge-stop sensitivity in pass 2
 static const float  DIRECTION_ALIGNMENT_MIN = 0.7f;
 static const float  MIN_COHERENCE        = 0.08f;
 
 static const float  CONSENSUS_THRESHOLD  = 0.6f;
-static const float  EDGE_SENSITIVITY     = 1.2f;
-static const float  MIN_CONSENSUS_EDGE   = 0.15f;
+static const float  EDGE_SENSITIVITY     = 4.0f;   // gate 1 distance-2 gain
+static const float  MIN_CONSENSUS_EDGE   = 0.10f;  // was 0.15 — admit moderately-strong consensus
 
 static const float  QUALITY_TARGET_HIGH  = 0.98f;
 static const float  QUALITY_TARGET_LOW   = 0.65f;
@@ -65,12 +66,11 @@ static const float  QUALITY_BOOST_STRONG = 0.15f;
 static const float  QUALITY_CLAMP_MIN    = 0.4f;
 static const float  QUALITY_CLAMP_MAX    = 0.98f;
 
-// Coherence damping disabled (floor = 1.0). Kept as a tuning knob in case
-// corner behavior needs adjustment. Set to 0.3 or lower to re-enable.
+// Coherence damping disabled (floor = 1.0). Kept as a tuning knob.
 static const float  CORNER_CONFIDENCE_FLOOR = 1.0f;
 
-// Constant-folded product (was JUMP_GAIN * EDGE_SENSITIVITY at runtime).
-static const float  JUMP_GAIN_EDGE       = 3.0f;   // balanced
+// Jump-gate gain for gates 2 and 3 (1px axial / diagonal).
+static const float  JUMP_GAIN_EDGE       = 3.0f;
 
 // Oblique tuning
 static const float  OBLIQUE_BLEND_FLOOR  = 0.80f;
@@ -100,7 +100,7 @@ texture EdgeDataTex1
 	Format = RGBA16F;
 };
 
-// R=coherence_7 (rest zero — triangular lattice removed)
+// R=coherence_7
 texture EdgeDataTex2
 {
 	Width  = BUFFER_WIDTH;
@@ -164,10 +164,14 @@ static const float KERNEL_5x5[5] = { 1.0f, 4.0f, 6.0f, 4.0f, 1.0f };
 static const float KERNEL_7x7[7] = { 1.0f, 3.0f, 6.0f, 7.0f, 6.0f, 3.0f, 1.0f };
 
 // =============================================================================
-// FAST CONSENSUS EDGE DETECTOR - CHROMA-AWARE, NEARBY-ALIAS SENSITIVE
+// FAST CONSENSUS EDGE DETECTOR — THREE-GATE AND
+// Gate 1: distance-2 color jump in 8 directions (replaces Sobel)
+// Gate 2: 1px axial color jump
+// Gate 3: 1px diagonal color jump
 // =============================================================================
-float fast_edge_consensus(float2 tex, float2 offset, float3 centerColor, float centerLum)
+float fast_edge_consensus(float2 tex, float2 offset, float3 centerColor)
 {
+	// ---- 3x3 core samples, excluding center (8 taps) ----
 	float3 c[8];
 	[unroll]
 	for (int i = 0; i < 8; i++) {
@@ -190,39 +194,44 @@ float fast_edge_consensus(float2 tex, float2 offset, float3 centerColor, float c
 	const float3 cS  = c[6];
 	const float3 cSE = c[7];
 
+	// ---- Distance-2 ring: 4 axial + 4 diagonal ----
 	float3 cN2 = tex2Dlod(ColorSampler, float4(clamp(tex + float2( 0.0f, -2.0f) * offset, 0.0f, 1.0f), 0.0f, 0.0f)).rgb;
 	float3 cS2 = tex2Dlod(ColorSampler, float4(clamp(tex + float2( 0.0f,  2.0f) * offset, 0.0f, 1.0f), 0.0f, 0.0f)).rgb;
 	float3 cE2 = tex2Dlod(ColorSampler, float4(clamp(tex + float2( 2.0f,  0.0f) * offset, 0.0f, 1.0f), 0.0f, 0.0f)).rgb;
 	float3 cW2 = tex2Dlod(ColorSampler, float4(clamp(tex + float2(-2.0f,  0.0f) * offset, 0.0f, 1.0f), 0.0f, 0.0f)).rgb;
 
-	float3 gx = cNW * -1.0f + cNE * 1.0f
-	          + cW  * -2.0f + cE  * 2.0f
-	          + cSW * -1.0f + cSE * 1.0f;
+	float2 d2off = float2(1.41421356f, 1.41421356f);
+	float3 cNW2 = tex2Dlod(ColorSampler, float4(clamp(tex + float2(-d2off.x, -d2off.y) * offset, 0.0f, 1.0f), 0.0f, 0.0f)).rgb;
+	float3 cNE2 = tex2Dlod(ColorSampler, float4(clamp(tex + float2( d2off.x, -d2off.y) * offset, 0.0f, 1.0f), 0.0f, 0.0f)).rgb;
+	float3 cSW2 = tex2Dlod(ColorSampler, float4(clamp(tex + float2(-d2off.x,  d2off.y) * offset, 0.0f, 1.0f), 0.0f, 0.0f)).rgb;
+	float3 cSE2 = tex2Dlod(ColorSampler, float4(clamp(tex + float2( d2off.x,  d2off.y) * offset, 0.0f, 1.0f), 0.0f, 0.0f)).rgb;
 
-	float3 gy = cNW * -1.0f + cN * -2.0f + cNE * -1.0f
-	          + cSW *  1.0f + cS *  2.0f + cSE *  1.0f;
+	// =====================================================================
+	// GATE 1: distance-2 color jump, 8 directions
+	// =====================================================================
+	float d2 = max3(abs(cN2  - centerColor));
+	d2 = max(d2, max3(abs(cS2  - centerColor)));
+	d2 = max(d2, max3(abs(cE2  - centerColor)));
+	d2 = max(d2, max3(abs(cW2  - centerColor)));
+	d2 = max(d2, max3(abs(cNW2 - centerColor)));
+	d2 = max(d2, max3(abs(cNE2 - centerColor)));
+	d2 = max(d2, max3(abs(cSW2 - centerColor)));
+	d2 = max(d2, max3(abs(cSE2 - centerColor)));
 
-	float3 sobelCh = sqrt(gx * gx + gy * gy);
-	float sobelMag = max3(sobelCh);
-	float lumaSobel = dot(abs(gx) + abs(gy), LUM_WEIGHTS) * 0.5f;
-	sobelMag = max(sobelMag, lumaSobel);
+	float edge1 = saturate(d2 * EDGE_SENSITIVITY);
 
-	float lumN2 = dot(cN2, LUM_WEIGHTS);
-	float lumS2 = dot(cS2, LUM_WEIGHTS);
-	float lumE2 = dot(cE2, LUM_WEIGHTS);
-	float lumW2 = dot(cW2, LUM_WEIGHTS);
-	float farGrad = max(abs(lumN2 - centerLum), max(abs(lumS2 - centerLum),
-	                 max(abs(lumE2 - centerLum), abs(lumW2 - centerLum))));
-	sobelMag = max(sobelMag, farGrad * 0.75f);
-
-	float edge1 = saturate(sobelMag * EDGE_SENSITIVITY);
-
+	// =====================================================================
+	// GATE 2: 1px axial color jump
+	// =====================================================================
 	float axN = max3(abs(cN - centerColor));
 	float axS = max3(abs(cS - centerColor));
 	float axE = max3(abs(cE - centerColor));
 	float axW = max3(abs(cW - centerColor));
 	float axialJump = max(max(axN, axS), max(axE, axW));
 
+	// =====================================================================
+	// GATE 3: 1px diagonal color jump
+	// =====================================================================
 	float dgNW = max3(abs(cNW - centerColor));
 	float dgNE = max3(abs(cNE - centerColor));
 	float dgSW = max3(abs(cSW - centerColor));
@@ -232,6 +241,9 @@ float fast_edge_consensus(float2 tex, float2 offset, float3 centerColor, float c
 	float edge2 = saturate(axialJump * JUMP_GAIN_EDGE);
 	float edge3 = saturate(diagJump  * JUMP_GAIN_EDGE);
 
+	// =====================================================================
+	// AND-gate consensus
+	// =====================================================================
 	float consensus = edge1 * edge2 * edge3;
 	float threshold = CONSENSUS_THRESHOLD * CONSENSUS_THRESHOLD * CONSENSUS_THRESHOLD;
 	consensus = smoothstep(threshold * 0.5f, threshold * 1.5f, consensus);
@@ -425,9 +437,8 @@ void PS_DetectEdges(
 {
 	float2 offset = RT_METRICS.xy;
 	float3 centerColor = tex2D(ColorSampler, tex).rgb;
-	float centerLum = dot(centerColor, LUM_WEIGHTS);
 
-	float consensus = fast_edge_consensus(tex, offset, centerColor, centerLum);
+	float consensus = fast_edge_consensus(tex, offset, centerColor);
 
 	if (consensus < 0.1f) {
 		out0 = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -461,7 +472,7 @@ void PS_DetectEdges(
 	float2 tangent7;
 	decompose_structure_tensor(S11_7, S12_7, S22_7, lambda1_7, lambda2_7, tangent7);
 
-	float adaptedKnee = RELATIVE_KNEE * max(centerLum, 0.02f);
+	float adaptedKnee = RELATIVE_KNEE * max(dot(centerColor, LUM_WEIGHTS), 0.02f);
 
 	float meanGradMag_5 = sqrt(max(lambda1_5 + lambda2_5, 0.0f));
 	float meanGradMag_7 = sqrt(max(lambda1_7 + lambda2_7, 0.0f));
