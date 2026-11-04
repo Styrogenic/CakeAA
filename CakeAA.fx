@@ -165,7 +165,7 @@ static const float KERNEL_7x7[7] = { 1.0f, 3.0f, 6.0f, 7.0f, 6.0f, 3.0f, 1.0f };
 
 // =============================================================================
 // FAST CONSENSUS EDGE DETECTOR — THREE-GATE AND
-// Gate 1: distance-2 color jump in 8 directions (replaces Sobel)
+// Gate 1: distance-2 color jump in 8 directions
 // Gate 2: 1px axial color jump
 // Gate 3: 1px diagonal color jump
 // =============================================================================
@@ -255,14 +255,15 @@ float fast_edge_consensus(float2 tex, float2 offset, float3 centerColor)
 }
 
 // =============================================================================
-// FUSED TENSOR COMPUTATION (5x5 + 7x7 only)
+// FUSED TENSOR COMPUTATION (5x5 + 7x7) — normalizes internally, returns
+// gradient sums only (no separate weight out-params).
 // =============================================================================
 void compute_all_tensors(
 	float2 tex,
 	float2 offset,
 	float3 centerColor,
-	out float3 gx5, out float3 gy5, out float w5,
-	out float3 gx7, out float3 gy7, out float w7)
+	out float3 gx5, out float3 gy5,
+	out float3 gx7, out float3 gy7)
 {
 	// 5x5 Rotated body
 	gx5 = float3(0.0f, 0.0f, 0.0f);
@@ -308,11 +309,9 @@ void compute_all_tensors(
 		}
 	}
 
+	// Normalize inline (lossless — same ops as before, just not passed out)
 	if (totalWeight5 > 0.0f) { float inv = 1.0f / totalWeight5; gx5 *= inv; gy5 *= inv; }
 	if (totalWeight7 > 0.0f) { float inv = 1.0f / totalWeight7; gx7 *= inv; gy7 *= inv; }
-
-	w5 = totalWeight5;
-	w7 = totalWeight7;
 }
 
 // =============================================================================
@@ -320,23 +319,12 @@ void compute_all_tensors(
 // =============================================================================
 void normalize_and_regularize_tensor(
 	inout float S11, inout float S12, inout float S22,
-	float weightSum,
 	float gradientScale)
 {
 	const float EPSILON = 1e-6f;
 
-	if (weightSum > 0.0f)
-	{
-		float invWeightSum = 1.0f / weightSum;
-		S11 = S11 * invWeightSum + EPSILON;
-		S12 *= invWeightSum;
-		S22 = S22 * invWeightSum + EPSILON;
-	}
-	else
-	{
-		S11 += EPSILON;
-		S22 += EPSILON;
-	}
+	S11 += EPSILON;
+	S22 += EPSILON;
 
 	if (gradientScale > 0.0f)
 	{
@@ -449,9 +437,8 @@ void PS_DetectEdges(
 	}
 
 	float3 gx5, gy5, gx7, gy7;
-	float w5, w7;
 
-	compute_all_tensors(tex, offset, centerColor, gx5, gy5, w5, gx7, gy7, w7);
+	compute_all_tensors(tex, offset, centerColor, gx5, gy5, gx7, gy7);
 
 	float S11_5 = dot(gx5, gx5);
 	float S12_5 = dot(gx5, gy5);
@@ -461,8 +448,8 @@ void PS_DetectEdges(
 	float S12_7 = dot(gx7, gy7);
 	float S22_7 = dot(gy7, gy7);
 
-	normalize_and_regularize_tensor(S11_5, S12_5, S22_5, w5, 2.0f);
-	normalize_and_regularize_tensor(S11_7, S12_7, S22_7, w7, 3.0f);
+	normalize_and_regularize_tensor(S11_5, S12_5, S22_5, 2.0f);
+	normalize_and_regularize_tensor(S11_7, S12_7, S22_7, 3.0f);
 
 	float lambda1_5, lambda2_5;
 	float2 tangent5;
