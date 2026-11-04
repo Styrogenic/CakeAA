@@ -281,10 +281,6 @@ JUMP_GAIN_EDGE (default 3.0) scales the axial and diagonal jump gates in pass 1 
 - If grain near edges persists: step down toward 2.5
 - If faint thin edges start to disappear: step up toward 3.4
 
-### Corner damping
-
-CORNER_CONFIDENCE_FLOOR (default 1.0) controls the corner-damping mechanism. At 1.0, the mechanism is present but neutralized. Set to 0.3 or lower to re-enable corner damping at the cost of some blend reduction on low-coherence pixels.
-
 ---
 
 ## File Structure
