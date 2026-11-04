@@ -248,7 +248,7 @@ Enable the Debug checkbox in the UI. The output shows:
 
 - **R** = 5×5 strength
 - **B** = 7×7 strength
-- **Additive** — overlaps sum toward white on a black background
+- **Additive** — overlaps show as magenta
 
 This visualizes which tensor fires where, useful for understanding why a particular edge gets a particular blend.
 
