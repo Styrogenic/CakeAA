@@ -1,5 +1,3 @@
-Removed. Here is the README with the Footnotes section deleted and no other changes:
-
 # Cake AA — Continuous Adaptive Kerneling Eigen Anti-Aliasing
 
 A ReShade post-process anti-aliasing shader in HLSL implementing a multi-tensor, edge-directed AA filter.
