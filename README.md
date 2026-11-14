@@ -1,3 +1,5 @@
+Removed. Here is the README with the Footnotes section deleted and no other changes:
+
 # Cake AA — Continuous Adaptive Kerneling Eigen Anti-Aliasing
 
 A ReShade post-process anti-aliasing shader in HLSL implementing a multi-tensor, edge-directed AA filter.
@@ -41,14 +43,16 @@ Gate 1's distance-2 footprint decorrelates it from the two 1px jump gates, so th
 
 **Step 2: Structure tensors (compute_all_tensors)**
 
-| Tensor | Footprint | Side length | Weights | Outer product values |
-|--------|-----------|-------------|---------|----------------------|
-| 5×5 | Rotated 45° grid, coords (col−row)/√2 and (col+row)/√2 | 5 taps | Separable binomial 1, 4, 6, 4, 1 | From 11^4 |
-| 7×7 | Axis-aligned square | 7 taps (1.4× the 5×5) | Separable 1, 3, 6, 7, 6, 3, 1 | From 111^3 |
+| Tensor | Footprint | Side length | Weights | Notes |
+|--------|-----------|-------------|---------|-------|
+| 5×5 | Rotated 45° grid, coords (col−row)/√2 and (col+row)/√2 | 5 taps | Iso-diamond radial profile `{1.0, 0.55, 0.10}` indexed by `r = max(|row|,|col|)` | Rotational symmetry on the diamond — no rotated-square corner bias |
+| 7×7 | Axis-aligned square | 7 taps (1.4× the 5×5) | Separable binomial `1, 3, 6, 7, 6, 3, 1` | Genuine separable grid |
 
 The 7×7 tensor's side length is 1.4× the 5×5's — a 7:5 ratio — giving it proportionally larger edge-sampling reach. The 5×5 samples on a rotated 45° grid, so it resolves diagonal structure densely and axis-aligned structure coarsely; the 7×7 samples on an axis-aligned square grid and does the reverse. The two are complementary.
 
 Each tensor accumulates gx and gy (3-channel gradient sums) and a weight total, then normalizes gx and gy internally by that weight sum before returning. The function yields only the normalized gradient sums; weight totals are not passed out. Tensor components are S11 = gx·gx, S12 = gx·gy, S22 = gy·gy, computed on the normalized gradients.
+
+The 5×5 weight profile was changed from a separable binomial product to an iso-diamond radial profile so that the tensor's support is rotationally symmetric about the pixel on the diamond lattice. This removes a structural oblique bias that the oblique-tuning constants previously had to compensate for; those constants are now a refinement rather than a correction.
 
 **Step 3: Normalize and regularize**
 
@@ -92,13 +96,27 @@ compute_angle_quality rewards tangents aligned to image axes or 45° diagonals, 
 
 Combines the two strengths via RMS, coherence_7, and angleQuality into a per-pixel blend amount. Stronger edges produce more blend; high coherence produces a coherenceBoost.
 
-**Corner damping** — structureConfidence = lerp(CORNER_CONFIDENCE_FLOOR, 1.0, coherence) multiplies strengthQuality. The floor sets the confidence multiplier at zero coherence, scaling up with coherence, so corner-like pixels get reduced overall blend, preventing corner smearing and junction blow-outs. This is an active artifact-prevention safeguard, complementary to the per-tap dirWeight gate below.
+**Corner damping** — structureConfidence = lerp(CORNER_CONFIDENCE_FLOOR, 1.0, coherence) multiplies strengthQuality. The floor sets the confidence multiplier at zero coherence, scaling up with coherence, so corner-like pixels get reduced overall blend, preventing corner smearing and junction blow-outs. At the default `CORNER_CONFIDENCE_FLOOR = 1.0` the damping is a no-op; lower the floor (e.g. 0.85) to activate it. This is complementary to the per-tap dirWeight gate below.
 
 Very weak edges (edgeStrength < 0.1) are pulled toward 0.1 and very strong edges (> 0.8) toward 0.9, to avoid over-blur and under-blur at the extremes.
 
+**Stability damping (apply_stability_damping)**
+
+Before the blend is scaled by AA_STRENGTH, it is soft-pulled toward 0.5 on pixels where the local estimate is unreliable:
+
+```
+reliability = clamp(consensus * lerp(0.5, 1.0, coherence), 0, 1)
+damp        = lerp(STABILITY_FLOOR, 1.0, reliability)
+blend       = lerp(0.5, blend, damp)
+```
+
+Reliable pixels (`reliability ≈ 1`) keep their full blend. Unreliable pixels (`reliability ≈ 0`) keep only `STABILITY_FLOOR` of their blend delta, biased toward the midpoint. This is the local, history-free analogue of temporal hysteresis: it damps the per-pixel blend on noisy estimates without requiring a history buffer, reprojection, or disocclusion handling.
+
 **Kernel mix**
 
-kernelPref7 = strength7 / (strength5 + strength7), boosted by longEdgeFactor × angleQuality, then smoothstepped. Confident long edges get the long 7×7 kernel; short and fine features get the 5×5.
+kernelPref7 = strength7 / (strength5 + strength7), boosted by longEdgeFactor × angleQuality, then smoothstepped over `[KERNEL_MIX_LO, KERNEL_MIX_HI]` (default `[0.10, 0.75]`). Confident long edges get the long 7×7 kernel; short and fine features get the 5×5.
+
+The transition range is deliberately wide. A narrow ramp on a noisy quantity like `strength7/(strength5+strength7)` causes per-pixel flicker near the crossover; widening it trades a little selectivity for a much smoother derivative of kernelMix with respect to the underlying strengths, so the mixed kernel evolves continuously instead of snapping.
 
 Because both kernelPref7 and the boost rise with coherence and angle quality, the 7×7 gets more attention as an edge becomes longer and more coherent; the 5×5 is the sharper, diagonal fallback for short and fine features. An oblique bias additionally pulls kernelMix toward the 5×5 when angleQuality < 0.7 and coherence_7 < 0.5, using the rotated diagonal lattice for its geometric purpose.
 
@@ -123,11 +141,13 @@ Each tap weight is kernelWeight × dirWeight × stopWeight.
 | dirWeight | smoothstep(dirAlignMin, dirAlignMax, dot(centerTangent, sampleTangent)) | Down-weights neighbors whose tangent points differently — the primary guard against bleeding across edges and corners |
 | stopWeight | 1 / (1 + 2x²) where x = colorDiff × COLOR_SENSITIVITY, relaxed by sampleEdge | Suppresses taps with large color differences; relaxation prevents halos |
 
+dirWeight guards against degenerate tangents: if the center tangent's squared length is below `1e-6`, `dirAlign` defaults to 1.0 rather than being driven by a meaningless dot product. Same guard for both kernels.
+
 dirAlignMin is relaxed toward 0.55 on oblique edges (lerp(0.55, 0.7, angleQuality)) to admit more oblique-aligned neighbors without opening the gate on corners.
 
 **Final blend**
 
-The center is preloaded with a large initial weight of 16 to 32 (by kernelMix), keeping the result near the original unless neighbors strongly agree. finalColor = acc / totalWeight, output = lerp(centerColor, finalColor, blend).
+The center is preloaded with a large initial weight of 16 to 32 (by kernelMix), keeping the result near the original unless neighbors strongly agree. finalColor = acc / totalWeight, output = lerp(centerColor, finalColor, blend). The final blend is clamped to `[0, 1]` by the stability damping and the scaling step, so `AA_STRENGTH` values above 1 remain safe.
 
 ---
 
@@ -135,13 +155,13 @@ The center is preloaded with a large initial weight of 16 to 32 (by kernelMix), 
 
 **Scale invariance.** All tensors normalize by weight sum (in Step 2) and gradient scale (in Step 3), so they respond to structure at any contrast level. Combined with sub-texel sampling steps, this makes Cake AA functional as subpixel AA.
 
-**Two complementary kernels.** Rotated 5×5 and axis-aligned 7×7. The 7×7's side length is 1.4× the 5×5's, giving it proportionally larger reach; the 5×5's rotated grid resolves diagonals that the 7×7 resolves poorly, and vice versa.
+**Two complementary kernels.** Rotated 5×5 and axis-aligned 7×7. The 7×7's side length is 1.4× the 5×5's, giving it proportionally larger reach; the 5×5's rotated grid resolves diagonals that the 7×7 resolves poorly, and vice versa. The 5×5 uses an iso-diamond radial weight profile, so its support is rotationally symmetric on the diamond lattice rather than rotated-square biased.
 
 **Consensus gating.** The cheap three-gate AND detector skips most pixels — including flat regions and noise — before the expensive tensor loops. Gate 1's distance-2 footprint keeps the AND discriminating.
 
 **Along-tangent-only blur.** The filter never samples perpendicular to the local edge, so it smooths along edges, not across them.
 
-**Layered artifact prevention.** Corner damping in the blend strength pulls back overall on low-coherence pixels, per-tap direction alignment rejects disagreeing neighbors, and edge-stop rejects large color jumps. These are three complementary guards, all active.
+**Layered artifact prevention.** Corner damping in the blend strength pulls back overall on low-coherence pixels, per-tap direction alignment rejects disagreeing neighbors, and edge-stop rejects large color jumps. These are three complementary guards. Stability damping is a fourth: it soft-pulls the blend toward 0.5 on pixels whose consensus and coherence are both weak, suppressing sub-pixel crawl from noisy strengths without a history buffer.
 
 **Adaptive everything.** Knee adapts to luminance, blend adapts to strength / coherence / angle, kernel mix adapts to which tensor dominates, and step size adapts to coherence and angle quality. The result is aggressive on clean, long, axis-aligned edges and conservative on corners, fine detail, and oblique boundaries.
 
@@ -157,7 +177,7 @@ The default parameters include several oblique-specific adjustments:
 | OBLIQUE_DIRMIN_FLOOR | 0.55 | Widens the tangent-agreement window on oblique edges |
 | OBLIQUE_5X5_BIAS | 0.60 | Pulls kernelMix toward the rotated 5×5 on oblique edges with moderate coherence |
 
-These stay inside the tensor/blur paradigm — no pattern matching — and are intended to stop the filter from fighting its own oblique machinery.
+These stay inside the tensor/blur paradigm — no pattern matching — and are intended to stop the filter from fighting its own oblique machinery. With the iso-diamond 5×5 weights the oblique bias is now a refinement rather than a correction of a structural support bias.
 
 ---
 
@@ -207,9 +227,26 @@ JUMP_GAIN_EDGE (default 3.0) scales the axial and diagonal jump gates in pass 1 
 - If grain near edges persists: step down toward 2.5
 - If faint thin edges start to disappear: step up toward 3.4
 
+### Kernel-mix transition
+
+`KERNEL_MIX_LO` (default 0.10) and `KERNEL_MIX_HI` (default 0.75) set the smoothstep bounds on the kernelMix quantity. A narrower range increases selectivity between the two kernels; a wider range smooths the crossover and reduces per-pixel flicker at the boundary.
+
+- Widened from the original `[0.15, 0.65]` for temporal stability
+- If 5×5/7×7 selection looks sluggish: narrow toward `[0.15, 0.65]`
+- If flicker persists at the crossover: widen toward `[0.05, 0.85]`
+
+### Stability damping
+
+`STABILITY_FLOOR` (default 0.35) sets how much of the blend delta survives on the least-reliable pixels. Lower values damp more aggressively toward the midpoint (more AA on noisy edges); higher values leave more of the original blend intact.
+
+- More damping: ~0.20
+- Default: 0.35
+- Less damping: ~0.50
+- At 1.0 the stage is a no-op
+
 ### Corner damping
 
-CORNER_CONFIDENCE_FLOOR controls the corner-damping mechanism. The floor sets the confidence multiplier at zero coherence; it scales up to 1.0 with coherence. Lower values damp corners more aggressively; higher values reduce the damping.
+CORNER_CONFIDENCE_FLOOR controls the corner-damping mechanism. The floor sets the confidence multiplier at zero coherence; it scales up to 1.0 with coherence. Lower values damp corners more aggressively; higher values reduce the damping. At the default 1.0 the mechanism is disabled (multiplier is always 1.0); set to ~0.85 to activate.
 
 ---
 
@@ -221,13 +258,14 @@ CakeAA.fx
 - UI Controls — Debug toggle
 - Parameters — tuning constants
 - Textures / Samplers — backbuffer + four edge data targets
-- Utility functions — max3, kernel tables
+- Utility functions — max3, kernel tables (`DIAMOND_W`, `KERNEL_7x7`), DEG2RAD
 - fast_edge_consensus — three-gate AND detector
-- compute_all_tensors — fused 5×5 and 7×7 tensor bodies; normalizes internally, returns normalized gradients only
+- compute_all_tensors — fused 5×5 (iso-diamond) and 7×7 (separable binomial) tensor bodies; normalizes internally, returns normalized gradients only
 - normalize_and_regularize_tensor — epsilon + gradient-scale normalization (weight-sum normalization happens in compute_all_tensors)
 - decompose_structure_tensor
 - compute_angle_quality
 - compute_adaptive_blend
+- apply_stability_damping — local, history-free blend damping on unreliable pixels
 - PS_DetectEdges — pass 1
 - edge_stop_weight
 - PS_ApplyAA — pass 2
