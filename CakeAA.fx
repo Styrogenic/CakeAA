@@ -20,12 +20,6 @@
 //   - Minor: guard against degenerate tangents, safer dirWeight when tangent is near-zero,
 //     explicit clamp on final blend.
 //
-// REV 3:
-//   - Consensus gates and edge-stop weight now use RELATIVE (Weber) contrast:
-//     |a-b| / max(a,b) per channel, max across RGB. Two near-white bodies with a
-//     small absolute but large relative difference now register as an edge.
-//   - EDGE_SENSITIVITY / JUMP_GAIN_EDGE retuned for relative units (12.0 / 10.0).
-//
 // DEBUG VIEW:
 //   R = 5x5 strength, B = 7x7 strength, additive.
 //   Black background; overlaps sum toward white.
@@ -72,9 +66,8 @@ static const float  DIRECTION_ALIGNMENT_MIN = 0.7f;
 static const float  MIN_COHERENCE        = 0.08f;
 
 static const float  CONSENSUS_THRESHOLD  = 0.6f;
-// REV 3: gains retuned for RELATIVE jump units.
-static const float  EDGE_SENSITIVITY     = 12.0f;  // gate 1 distance-2 gain (was 4.0)
-static const float  MIN_CONSENSUS_EDGE   = 0.10f;  // admit moderately-strong consensus
+static const float  EDGE_SENSITIVITY     = 4.0f;   // gate 1 distance-2 gain
+static const float  MIN_CONSENSUS_EDGE   = 0.10f;  // was 0.15 — admit moderately-strong consensus
 
 static const float  QUALITY_TARGET_HIGH  = 0.98f;
 static const float  QUALITY_TARGET_LOW   = 0.65f;
@@ -86,8 +79,8 @@ static const float  QUALITY_CLAMP_MAX    = 0.98f;
 // Coherence damping disabled (floor = 1.0). Kept as a tuning knob.
 static const float  CORNER_CONFIDENCE_FLOOR = 1.0f;
 
-// Jump-gate gain for gates 2 and 3 (1px axial / diagonal). REV 3: relative units.
-static const float  JUMP_GAIN_EDGE       = 10.0f;  // was 3.0
+// Jump-gate gain for gates 2 and 3 (1px axial / diagonal).
+static const float  JUMP_GAIN_EDGE       = 3.0f;
 
 // Oblique tuning
 static const float  OBLIQUE_BLEND_FLOOR  = 0.80f;
@@ -99,7 +92,9 @@ static const float  OBLIQUE_5X5_BIAS     = 0.60f;
 static const float  KERNEL_MIX_LO        = 0.10f;
 static const float  KERNEL_MIX_HI        = 0.75f;
 
-// Temporal-stability damping (REV 2).
+// Temporal-stability damping (REV 2). No history buffer; uses consensus*coherence
+// as a proxy for how reliable the local estimate is, and softens the blend
+// delta on unreliable pixels.
 static const float  STABILITY_FLOOR      = 0.35f;
 
 #define RT_METRICS float4(BUFFER_RCP_WIDTH, BUFFER_RCP_HEIGHT, BUFFER_WIDTH, BUFFER_HEIGHT)
@@ -182,28 +177,26 @@ sampler EdgeDataSampler3
 // =============================================================================
 float max3(float3 v) { return max(v.x, max(v.y, v.z)); }
 
-// REV 3: per-channel Weber relative jump, max across RGB.
-// Floor of 1/255 avoids /0 on black and keeps black-vs-near-black sane.
-float rel_jump(float3 a, float3 b)
-{
-	float3 d = abs(a - b);
-	float3 m = max(max(a, b), float3(1.0f / 255.0f));
-	return max3(d / m);
-}
-
 static const float DEG2RAD = 0.017453292519943295f;
 
 // 5x5 iso-diamond radial weights (REV 2).
+// Indexed by rotated-lattice radius r in [0..2], where r = max(|row|,|col|)
+// in the rotated grid. Weight profile is a discrete Gaussian on the diamond:
+//   r=0: 1.0
+//   r=1: 0.55 (four diamond neighbors)
+//   r=2: 0.10 (outer diamond ring)
+// This removes the rotated-square bias of the previous separable binomial
+// product while keeping the low-noise derivative-of-Gaussian behavior.
 static const float DIAMOND_W[3] = { 1.0f, 0.55f, 0.10f };
 
-// 7x7 binomial stays separable/axis-aligned.
+// 7x7 binomial stays separable/axis-aligned (it is a genuine separable grid).
 static const float KERNEL_7x7[7] = { 1.0f, 3.0f, 6.0f, 7.0f, 6.0f, 3.0f, 1.0f };
 
 // =============================================================================
 // FAST CONSENSUS EDGE DETECTOR — THREE-GATE AND
-// Gate 1: distance-2 relative color jump in 8 directions
-// Gate 2: 1px axial relative color jump
-// Gate 3: 1px diagonal relative color jump
+// Gate 1: distance-2 color jump in 8 directions
+// Gate 2: 1px axial color jump
+// Gate 3: 1px diagonal color jump
 // =============================================================================
 float fast_edge_consensus(float2 tex, float2 offset, float3 centerColor)
 {
@@ -243,35 +236,35 @@ float fast_edge_consensus(float2 tex, float2 offset, float3 centerColor)
 	float3 cSE2 = tex2Dlod(ColorSampler, float4(clamp(tex + float2( d2off.x,  d2off.y) * offset, 0.0f, 1.0f), 0.0f, 0.0f)).rgb;
 
 	// =====================================================================
-	// GATE 1: distance-2 relative jump, 8 directions
+	// GATE 1: distance-2 color jump, 8 directions
 	// =====================================================================
-	float d2 = rel_jump(cN2,  centerColor);
-	d2 = max(d2, rel_jump(cS2,  centerColor));
-	d2 = max(d2, rel_jump(cE2,  centerColor));
-	d2 = max(d2, rel_jump(cW2,  centerColor));
-	d2 = max(d2, rel_jump(cNW2, centerColor));
-	d2 = max(d2, rel_jump(cNE2, centerColor));
-	d2 = max(d2, rel_jump(cSW2, centerColor));
-	d2 = max(d2, rel_jump(cSE2, centerColor));
+	float d2 = max3(abs(cN2  - centerColor));
+	d2 = max(d2, max3(abs(cS2  - centerColor)));
+	d2 = max(d2, max3(abs(cE2  - centerColor)));
+	d2 = max(d2, max3(abs(cW2  - centerColor)));
+	d2 = max(d2, max3(abs(cNW2 - centerColor)));
+	d2 = max(d2, max3(abs(cNE2 - centerColor)));
+	d2 = max(d2, max3(abs(cSW2 - centerColor)));
+	d2 = max(d2, max3(abs(cSE2 - centerColor)));
 
 	float edge1 = saturate(d2 * EDGE_SENSITIVITY);
 
 	// =====================================================================
-	// GATE 2: 1px axial relative jump
+	// GATE 2: 1px axial color jump
 	// =====================================================================
-	float axN = rel_jump(cN, centerColor);
-	float axS = rel_jump(cS, centerColor);
-	float axE = rel_jump(cE, centerColor);
-	float axW = rel_jump(cW, centerColor);
+	float axN = max3(abs(cN - centerColor));
+	float axS = max3(abs(cS - centerColor));
+	float axE = max3(abs(cE - centerColor));
+	float axW = max3(abs(cW - centerColor));
 	float axialJump = max(max(axN, axS), max(axE, axW));
 
 	// =====================================================================
-	// GATE 3: 1px diagonal relative jump
+	// GATE 3: 1px diagonal color jump
 	// =====================================================================
-	float dgNW = rel_jump(cNW, centerColor);
-	float dgNE = rel_jump(cNE, centerColor);
-	float dgSW = rel_jump(cSW, centerColor);
-	float dgSE = rel_jump(cSE, centerColor);
+	float dgNW = max3(abs(cNW - centerColor));
+	float dgNE = max3(abs(cNE - centerColor));
+	float dgSW = max3(abs(cSW - centerColor));
+	float dgSE = max3(abs(cSE - centerColor));
 	float diagJump = max(max(dgNW, dgNE), max(dgSW, dgSE));
 
 	float edge2 = saturate(axialJump * JUMP_GAIN_EDGE);
@@ -291,7 +284,8 @@ float fast_edge_consensus(float2 tex, float2 offset, float3 centerColor)
 }
 
 // =============================================================================
-// FUSED TENSOR COMPUTATION (5x5 + 7x7)
+// FUSED TENSOR COMPUTATION (5x5 + 7x7) — normalizes internally, returns
+// gradient sums only (no separate weight out-params).
 // =============================================================================
 void compute_all_tensors(
 	float2 tex,
@@ -315,6 +309,7 @@ void compute_all_tensors(
 				(float)(col - row) * INV_SQRT2,
 				(float)(col + row) * INV_SQRT2
 			);
+			// Diamond radius in the rotated lattice.
 			int r = max(abs(row), abs(col));
 			float w = DIAMOND_W[r];
 			float2 sampleUV = clamp(tex + screenOffset * offset, 0.0f, 1.0f);
@@ -325,7 +320,7 @@ void compute_all_tensors(
 		}
 	}
 
-	// 7x7 Axis-aligned body.
+	// 7x7 Axis-aligned body (separable binomial is correct on this grid).
 	gx7 = float3(0.0f, 0.0f, 0.0f);
 	gy7 = float3(0.0f, 0.0f, 0.0f);
 	float totalWeight7 = 0.0f;
@@ -345,6 +340,7 @@ void compute_all_tensors(
 		}
 	}
 
+	// Normalize inline (lossless — same ops as before, just not passed out)
 	if (totalWeight5 > 0.0f) { float inv = 1.0f / totalWeight5; gx5 *= inv; gy5 *= inv; }
 	if (totalWeight7 > 0.0f) { float inv = 1.0f / totalWeight7; gx7 *= inv; gy7 *= inv; }
 }
@@ -449,6 +445,8 @@ float compute_adaptive_blend(
 
 // =============================================================================
 // Temporal-stability blend damping (REV 2)
+// Softens abrupt blend changes on pixels where the local estimate is unreliable
+// (low consensus * low coherence). No history buffer — purely local.
 // =============================================================================
 float apply_stability_damping(float blend, float consensus, float coherence)
 {
@@ -528,14 +526,14 @@ void PS_DetectEdges(
 }
 
 // =============================================================================
-// Edge stop weight (REV 3: Weber-relative)
+// Edge stop weight
 // =============================================================================
 float edge_stop_weight(float3 sampleColor, float3 centerColor, float sampleEdge)
 {
-	float3 d = abs(sampleColor - centerColor);
-	float3 m = max(max(sampleColor, centerColor), float3(1.0f / 255.0f));
-	float r = max3(d / m);
-	float x = r * COLOR_SENSITIVITY;
+	float colorDiff = max(abs(sampleColor.x - centerColor.x),
+	                     max(abs(sampleColor.y - centerColor.y),
+	                         abs(sampleColor.z - centerColor.z)));
+	float x = colorDiff * COLOR_SENSITIVITY;
 	float colorWeight = 1.0f / (1.0f + x * x * 2.0f);
 	return lerp(colorWeight, 1.0f, sampleEdge);
 }
@@ -588,7 +586,7 @@ float4 PS_ApplyAA(float4 pos : SV_Position, float2 tex : TEXCOORD) : SV_Target
 	float boost7 = safeLongEdgeFactor * angleQuality;
 	float kernelMix = lerp(kernelPref7, 1.0f, boost7);
 
-	// REV 2: widened kernelMix transition.
+	// REV 2: widened kernelMix transition reduces per-pixel flicker.
 	kernelMix = smoothstep(KERNEL_MIX_LO, KERNEL_MIX_HI, kernelMix);
 
 	float obliqueBias = saturate((0.7f - angleQuality) * 2.0f)
