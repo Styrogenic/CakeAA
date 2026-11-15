@@ -19,6 +19,8 @@ Cake AA is a two-pass filter:
 
 The filter never samples perpendicular to the local edge, so it smooths along edges rather than across them.
 
+Both the consensus gates and the structure tensors operate on **relative** measures — the gates on Weber-relative color jumps, the tensors on weight-sum- and gradient-scale-normalized gradients. The whole pipeline is scale-invariant from the first cheap gate to the final tap weight, so it responds to structure at any contrast level, including boundaries between two near-white or two near-black bodies that an absolute-difference detector would miss.
+
 ---
 
 ## Pipeline
@@ -29,15 +31,17 @@ The filter never samples perpendicular to the local edge, so it smooths along ed
 
 A cheap three-gate AND detector decides whether a pixel is worth the expensive tensor math. If consensus is below 0.1, all outputs are zeroed and the pixel exits early.
 
+All three gates measure **relative (Weber) contrast** per channel — `|a − b| / max(a, b)`, floored at `1/255` to keep black-vs-near-black finite — and take the max across RGB. This is what makes the detector scale-invariant: a 3% jump on a near-white body (e.g. `0.94` vs `0.97`) produces a relative jump of ~`0.031`, the same as a 3% jump on a midtone, whereas an absolute-difference gate would divide that away to noise.
+
 | Gate | Signal | Notes |
 |------|--------|-------|
-| 1 | Distance-2 color jump | Max per-channel color difference between center and its eight distance-2 neighbors (4 axial + 4 diagonal) — chroma-aware |
-| 2 | 1px axial jump | Max per-channel color difference between center and its four axial 1px neighbors — chroma-aware |
-| 3 | 1px diagonal jump | Same for the four diagonal 1px neighbors |
+| 1 | Distance-2 relative color jump | Max per-channel **relative** color difference between center and its eight distance-2 neighbors (4 axial + 4 diagonal) — chroma-aware, scale-invariant |
+| 2 | 1px axial relative jump | Max per-channel **relative** color difference between center and its four axial 1px neighbors — chroma-aware, scale-invariant |
+| 3 | 1px diagonal relative jump | Same for the four diagonal 1px neighbors |
 
 Consensus = edge1 × edge2 × edge3, so all three must agree. It is smoothstepped around a cubed threshold and scaled by a smoothstep on the max of the three to suppress weak edges. This kills flat regions and isolated single-pixel noise before the tensor loops run.
 
-Gate 1's distance-2 footprint decorrelates it from the two 1px jump gates, so the AND remains discriminating rather than collapsing into a single correlated test.
+Gate 1's distance-2 footprint decorrelates it from the two 1px jump gates, so the AND remains discriminating rather than collapsing into a single correlated test. The relative measure adds a second axis of discrimination: the AND now fires on boundaries defined by *proportional* contrast, so it doesn't collapse on bright content the way an absolute-difference AND does.
 
 **Step 2: Structure tensors (compute_all_tensors)**
 
@@ -55,6 +59,8 @@ The 5×5 weight profile was changed from a separable binomial product to an iso-
 **Step 3: Normalize and regularize**
 
 normalize_and_regularize_tensor adds epsilon to the diagonal and divides by gradientScale² (2.0, 3.0). Weight-sum normalization already happened in Step 2, so this step only handles epsilon and gradient-scale invariance. The result is scale-invariant tensors that respond to relative structure rather than absolute brightness — suited to HDR and game content, and functional as subpixel AA.
+
+This is the second scale-invariance mechanism in the pipeline; the first is the relative consensus gates in Step 1. Together they mean a given edge contrast produces a comparable filter response whether the edge sits at luminance 0.1 or 0.95.
 
 **Step 4: Eigendecomposition**
 
@@ -137,7 +143,9 @@ Each tap weight is kernelWeight × dirWeight × stopWeight.
 |------|---------|---------|
 | Kernel weight | Radial falloff: 9/2 for 5×5, 24/12/3 for 7×7; scaled by kernelMix | Tap falloff |
 | dirWeight | smoothstep(dirAlignMin, dirAlignMax, dot(centerTangent, sampleTangent)) | Down-weights neighbors whose tangent points differently — the primary guard against bleeding across edges and corners |
-| stopWeight | 1 / (1 + 2x²) where x = colorDiff × COLOR_SENSITIVITY, relaxed by sampleEdge | Suppresses taps with large color differences; relaxation prevents halos |
+| stopWeight | 1 / (1 + 2x²) where x = relJump(sample, center) × COLOR_SENSITIVITY, relaxed by sampleEdge | Suppresses taps with large **relative** color differences; relaxation prevents halos |
+
+stopWeight uses the same Weber-relative measure as the consensus gates, so a tap across a near-white boundary is down-weighted by its *proportional* color jump rather than its absolute one. Without this, near-white boundaries would see full-weight taps and the along-edge average would bleed across them.
 
 dirWeight guards against degenerate tangents: if the center tangent's squared length is below `1e-6`, `dirAlign` defaults to 1.0 rather than being driven by a meaningless dot product. Same guard for both kernels.
 
@@ -151,15 +159,15 @@ The center is preloaded with a large initial weight of 16 to 32 (by kernelMix), 
 
 ## Key Design Choices
 
-**Scale invariance.** All tensors normalize by weight sum (in Step 2) and gradient scale (in Step 3), so they respond to structure at any contrast level. Combined with sub-texel sampling steps, this makes Cake AA functional as subpixel AA.
+**Scale invariance.** Every stage uses a relative measure. The consensus gates compute Weber-relative color jumps, the tensors normalize by weight sum (in Step 2) and gradient scale (in Step 3), and the edge-stop weight is also Weber-relative. Combined with sub-texel sampling steps, this makes Cake AA functional as subpixel AA and lets it respond to boundaries between two near-white or two near-black bodies that an absolute-difference detector would miss.
 
 **Two complementary kernels.** Rotated 5×5 and axis-aligned 7×7. The 7×7's side length is 1.4× the 5×5's, giving it proportionally larger reach; the 5×5's rotated grid resolves diagonals that the 7×7 resolves poorly, and vice versa. The 5×5 uses an iso-diamond radial weight profile, so its support is rotationally symmetric on the diamond lattice rather than rotated-square biased.
 
-**Consensus gating.** The cheap three-gate AND detector skips most pixels — including flat regions and noise — before the expensive tensor loops. Gate 1's distance-2 footprint keeps the AND discriminating.
+**Consensus gating.** The cheap three-gate AND detector skips most pixels — including flat regions and noise — before the expensive tensor loops. Gate 1's distance-2 footprint keeps the AND discriminating, and the relative measure adds a second axis of discrimination: the AND fires on proportional contrast, so it doesn't collapse on bright content the way an absolute-difference AND does.
 
 **Along-tangent-only blur.** The filter never samples perpendicular to the local edge, so it smooths along edges, not across them.
 
-**Layered artifact prevention.** Corner damping in the blend strength pulls back overall on low-coherence pixels, per-tap direction alignment rejects disagreeing neighbors, and edge-stop rejects large color jumps. These are three complementary guards. Stability damping is a fourth: it soft-pulls the blend toward 0.5 on pixels whose consensus and coherence are both weak, suppressing sub-pixel crawl from noisy strengths without a history buffer.
+**Layered artifact prevention.** Corner damping in the blend strength pulls back overall on low-coherence pixels, per-tap direction alignment rejects disagreeing neighbors, and edge-stop rejects large relative color jumps. These are three complementary guards. Stability damping is a fourth: it soft-pulls the blend toward 0.5 on pixels whose consensus and coherence are both weak, suppressing sub-pixel crawl from noisy strengths without a history buffer.
 
 **Adaptive everything.** Knee adapts to luminance, blend adapts to strength / coherence / angle, kernel mix adapts to which tensor dominates, and step size adapts to coherence and angle quality. The result is aggressive on clean, long, axis-aligned edges and conservative on corners, fine detail, and oblique boundaries.
 
@@ -194,11 +202,14 @@ Either way, Cake's along-tangent-only, scale-invariant behavior composes well: i
 
 ### Edge sensitivity (gate 1)
 
-EDGE_SENSITIVITY (default 4.0) scales gate 1's distance-2 color jump. Higher values make gate 1 fire on smaller distance-2 color deltas.
+EDGE_SENSITIVITY (default **12.0**) scales gate 1's distance-2 **relative** color jump. Higher values make gate 1 fire on smaller relative color deltas.
 
-- Conservative: ~1.2–2.0
-- Aggressive: ~4.0–6.0
-- Above ~6.0, gate 1 saturates on most non-flat content and stops discriminating; the detector effectively becomes the two-gate AND
+Because REV 3 changed the gate from absolute to Weber-relative, the tuning bands are in different units from earlier revisions — old absolute-unit values (4.0, 6.0, etc.) do not transfer.
+
+- Conservative: ~8–10
+- Default: 12.0
+- Aggressive: ~12–16
+- Above ~16, gate 1 saturates on most non-flat content and stops discriminating; the detector effectively becomes the two-gate AND
 
 ### Consensus floor
 
@@ -209,21 +220,24 @@ MIN_CONSENSUS_EDGE (default 0.10) gates the whole consensus on max(edge1, edge2,
 
 ### Color sensitivity
 
-COLOR_SENSITIVITY (default 7.0) controls edge_stop_weight. Higher values suppress taps with larger color deltas more aggressively; lower values make the filter more forgiving of near-edge color differences.
+COLOR_SENSITIVITY (default 7.0) controls edge_stop_weight. Higher values suppress taps with larger **relative** color deltas more aggressively; lower values make the filter more forgiving of near-edge color differences.
 
-- Original: 8.0
-- Default: 7.0
+- Original (absolute units): 8.0
+- Default (relative units): 7.0
 - If grain near edges persists: step down toward 6.5
 - If halos appear: step up toward 7.5
 
 ### Jump-gate sensitivity
 
-JUMP_GAIN_EDGE (default 3.0) scales the axial and diagonal jump gates in pass 1 (edge2 and edge3). Lower values make the gates require a larger color jump before they fire, suppressing grainy detail close to edges at the detection stage.
+JUMP_GAIN_EDGE (default **10.0**) scales the axial and diagonal **relative** jump gates in pass 1 (edge2 and edge3). Lower values make the gates require a larger relative color jump before they fire, suppressing grainy detail close to edges at the detection stage.
 
-- Original: 4.0
-- Default: 3.0
-- If grain near edges persists: step down toward 2.5
-- If faint thin edges start to disappear: step up toward 3.4
+As with EDGE_SENSITIVITY, the relative-unit default and bands differ from earlier revisions; old absolute-unit values do not transfer.
+
+- Conservative: ~8
+- Default: 10.0
+- Aggressive: ~10–12
+- If grain near edges persists: step down toward 8
+- If faint thin edges start to disappear: step up toward 12
 
 ### Kernel-mix transition
 
@@ -256,8 +270,8 @@ CakeAA.fx
 - UI Controls — Debug toggle
 - Parameters — tuning constants
 - Textures / Samplers — backbuffer + four edge data targets
-- Utility functions — max3, kernel tables (`DIAMOND_W`, `KERNEL_7x7`), DEG2RAD
-- fast_edge_consensus — three-gate AND detector
+- Utility functions — max3, rel_jump (Weber-relative per-channel contrast), kernel tables (`DIAMOND_W`, `KERNEL_7x7`), DEG2RAD
+- fast_edge_consensus — three-gate AND detector, using rel_jump on all three gates
 - compute_all_tensors — fused 5×5 (iso-diamond) and 7×7 (separable binomial) tensor bodies; normalizes internally, returns normalized gradients only
 - normalize_and_regularize_tensor — epsilon + gradient-scale normalization (weight-sum normalization happens in compute_all_tensors)
 - decompose_structure_tensor
@@ -265,7 +279,7 @@ CakeAA.fx
 - compute_adaptive_blend
 - apply_stability_damping — local, history-free blend damping on unreliable pixels
 - PS_DetectEdges — pass 1
-- edge_stop_weight
+- edge_stop_weight — Weber-relative color-stop gate for AA taps
 - PS_ApplyAA — pass 2
 - technique CakeAA — EdgeDetection + AntiAliasing passes
 
