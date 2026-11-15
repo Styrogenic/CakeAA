@@ -1,8 +1,6 @@
 # Cake AA — Continuous Adaptive Kerneling Eigen Anti-Aliasing
 
-A ReShade post-process anti-aliasing shader in HLSL implementing a multi-tensor, edge-directed AA filter.
-
-It detects edges, builds local gradient tensors with different footprints, then blurs **along** edges — never across them — with per-pixel strength and kernel selection driven by edge confidence.
+A ReShade post-process anti-aliasing shader in HLSL implementing a multi-tensor, edge-directed AA filter. It detects edges, builds local gradient tensors with different footprints, then blurs **along** edges — never across them — with per-pixel strength and kernel selection driven by edge confidence.
 
 - **Author:** Alex Aaron Goven
 - **Copyright © 2026**
@@ -19,7 +17,9 @@ Cake AA is a two-pass filter:
 
 The filter never samples perpendicular to the local edge, so it smooths along edges rather than across them.
 
-Both the consensus gates and the structure tensors operate on **relative** measures — the gates on Weber-relative color jumps, the tensors on weight-sum- and gradient-scale-normalized gradients. The whole pipeline is scale-invariant from the first cheap gate to the final tap weight, so it responds to structure at any contrast level, including boundaries between two near-white or two near-black bodies that an absolute-difference detector would miss.
+Scale invariance in the shipped shader is carried by two mechanisms, both downstream of detection. First, `compute_all_tensors` normalizes each gradient sum by its kernel weight total before returning, so tensor components are weight-sum-invariant. Second, `normalize_and_regularize_tensor` divides by `gradientScale` squared (2.0 for the 5×5, 3.0 for the 7×7), and the edge strength uses an adaptive knee, `RELATIVE_KNEE × max(centerLum, 0.02)`, so a given relative contrast produces a comparable strength regardless of absolute luminance.
+
+Detection itself — the consensus gates and `edge_stop_weight` — uses absolute per-channel difference, not relative. The near-white / near-black discrimination the adaptive knee provides happens after detection, in the strength and blend, not in the gates. This matters for tuning: the gate constants are in absolute units.
 
 ---
 
@@ -27,23 +27,21 @@ Both the consensus gates and the structure tensors operate on **relative** measu
 
 ### Pass 1 — Edge Detection (PS_DetectEdges)
 
-**Step 1: Consensus pre-filter (fast_edge_consensus)**
+**Step 1: Consensus pre-filter (`fast_edge_consensus`)**
 
-A cheap three-gate AND detector decides whether a pixel is worth the expensive tensor math. If consensus is below 0.1, all outputs are zeroed and the pixel exits early.
-
-All three gates measure **relative (Weber) contrast** per channel — `|a − b| / max(a, b)`, floored at `1/255` to keep black-vs-near-black finite — and take the max across RGB. This is what makes the detector scale-invariant: a 3% jump on a near-white body (e.g. `0.94` vs `0.97`) produces a relative jump of ~`0.031`, the same as a 3% jump on a midtone, whereas an absolute-difference gate would divide that away to noise.
+A cheap three-gate AND detector decides whether a pixel is worth the expensive tensor math. If consensus is below 0.1, all outputs are zeroed and the pixel exits early. All three gates measure the maximum per-channel absolute color difference across RGB.
 
 | Gate | Signal | Notes |
 |------|--------|-------|
-| 1 | Distance-2 relative color jump | Max per-channel **relative** color difference between center and its eight distance-2 neighbors (4 axial + 4 diagonal) — chroma-aware, scale-invariant |
-| 2 | 1px axial relative jump | Max per-channel **relative** color difference between center and its four axial 1px neighbors — chroma-aware, scale-invariant |
-| 3 | 1px diagonal relative jump | Same for the four diagonal 1px neighbors |
+| 1 | Distance-2 color jump | Max per-channel absolute color difference between center and its eight distance-2 neighbors (4 axial + 4 diagonal) — chroma-aware |
+| 2 | 1px axial color jump | Max per-channel absolute color difference between center and its four axial 1px neighbors — chroma-aware |
+| 3 | 1px diagonal color jump | Same for the four diagonal 1px neighbors |
 
 Consensus = edge1 × edge2 × edge3, so all three must agree. It is smoothstepped around a cubed threshold and scaled by a smoothstep on the max of the three to suppress weak edges. This kills flat regions and isolated single-pixel noise before the tensor loops run.
 
-Gate 1's distance-2 footprint decorrelates it from the two 1px jump gates, so the AND remains discriminating rather than collapsing into a single correlated test. The relative measure adds a second axis of discrimination: the AND now fires on boundaries defined by *proportional* contrast, so it doesn't collapse on bright content the way an absolute-difference AND does.
+Gate 1's distance-2 footprint decorrelates it from the two 1px jump gates, so the AND remains discriminating rather than collapsing into a single correlated test.
 
-**Step 2: Structure tensors (compute_all_tensors)**
+**Step 2: Structure tensors (`compute_all_tensors`)**
 
 | Tensor | Footprint | Side length | Weights | Notes |
 |--------|-----------|-------------|---------|-------|
@@ -54,17 +52,15 @@ The 7×7 tensor's side length is 1.4× the 5×5's — a 7:5 ratio — giving it 
 
 Each tensor accumulates gx and gy (3-channel gradient sums) and a weight total, then normalizes gx and gy internally by that weight sum before returning. The function yields only the normalized gradient sums; weight totals are not passed out. Tensor components are S11 = gx·gx, S12 = gx·gy, S22 = gy·gy, computed on the normalized gradients.
 
-The 5×5 weight profile was changed from a separable binomial product to an iso-diamond radial profile so that the tensor's support is rotationally symmetric about the pixel on the diamond lattice. This removes a structural oblique bias that the oblique-tuning constants previously had to compensate for; those constants are now a refinement rather than a correction.
+The 5×5 weight profile is an iso-diamond radial profile, so the tensor's support is rotationally symmetric about the pixel on the diamond lattice. This removes a structural oblique bias that the oblique-tuning constants would otherwise have to compensate for; those constants are now a refinement rather than a correction.
 
 **Step 3: Normalize and regularize**
 
-normalize_and_regularize_tensor adds epsilon to the diagonal and divides by gradientScale² (2.0, 3.0). Weight-sum normalization already happened in Step 2, so this step only handles epsilon and gradient-scale invariance. The result is scale-invariant tensors that respond to relative structure rather than absolute brightness — suited to HDR and game content, and functional as subpixel AA.
-
-This is the second scale-invariance mechanism in the pipeline; the first is the relative consensus gates in Step 1. Together they mean a given edge contrast produces a comparable filter response whether the edge sits at luminance 0.1 or 0.95.
+`normalize_and_regularize_tensor` adds epsilon to the diagonal and divides by `gradientScale` squared (2.0 for the 5×5, 3.0 for the 7×7). Weight-sum normalization already happened in Step 2, so this step only handles epsilon and gradient-scale invariance. The result is tensors that respond to relative structure rather than absolute brightness, suited to HDR and game content, and functional as subpixel AA.
 
 **Step 4: Eigendecomposition**
 
-decompose_structure_tensor extracts:
+`decompose_structure_tensor` extracts:
 
 - λ1 — largest eigenvalue, gradient energy **across** the edge
 - λ2 — smallest eigenvalue, gradient energy **along** the edge
@@ -81,7 +77,7 @@ Derived quantities:
 
 **Step 5: Angle quality**
 
-compute_angle_quality rewards tangents aligned to image axes or 45° diagonals, boosting oblique angles toward 1.0.
+`compute_angle_quality` rewards tangents aligned to image axes or 45° diagonals, boosting oblique angles toward 1.0.
 
 **Outputs**
 
@@ -96,29 +92,21 @@ compute_angle_quality rewards tangents aligned to image axes or 45° diagonals, 
 
 **Debug view:** if Debug is on, output is strength5 in R and strength7 in B, visualizing which tensor fires where.
 
-**Adaptive blend strength (compute_adaptive_blend)**
+**Adaptive blend strength (`compute_adaptive_blend`)**
 
 Combines the two strengths via RMS, coherence_7, and angleQuality into a per-pixel blend amount. Stronger edges produce more blend; high coherence produces a coherenceBoost.
 
-**Corner damping** — structureConfidence = lerp(CORNER_CONFIDENCE_FLOOR, 1.0, coherence) multiplies strengthQuality. The floor sets the confidence multiplier at zero coherence, scaling up with coherence, so corner-like pixels get reduced overall blend, preventing corner smearing and junction blow-outs. At the default `CORNER_CONFIDENCE_FLOOR = 1.0` the damping is a no-op; lower the floor (e.g. 0.85) to activate it. This is complementary to the per-tap dirWeight gate below.
+**Corner damping** — `structureConfidence = lerp(CORNER_CONFIDENCE_FLOOR, 1.0, coherence)` multiplies strengthQuality. The floor sets the confidence multiplier at zero coherence, scaling up with coherence, so corner-like pixels get reduced overall blend, preventing corner smearing and junction blow-outs. At the default `CORNER_CONFIDENCE_FLOOR = 1.0` the damping is a no-op; lower the floor (e.g. 0.85) to activate it. This is complementary to the per-tap dirWeight gate below.
 
 Very weak edges (edgeStrength < 0.1) are pulled toward 0.1 and very strong edges (> 0.8) toward 0.9, to avoid over-blur and under-blur at the extremes.
 
-**Stability damping (apply_stability_damping)**
+**Stability damping (`apply_stability_damping`)**
 
-Before the blend is scaled by AA_STRENGTH, it is soft-pulled toward 0.5 on pixels where the local estimate is unreliable:
-
-```
-reliability = clamp(consensus * lerp(0.5, 1.0, coherence), 0, 1)
-damp        = lerp(STABILITY_FLOOR, 1.0, reliability)
-blend       = lerp(0.5, blend, damp)
-```
-
-Reliable pixels (`reliability ≈ 1`) keep their full blend. Unreliable pixels (`reliability ≈ 0`) keep only `STABILITY_FLOOR` of their blend delta, biased toward the midpoint. This is the local, history-free analogue of temporal hysteresis: it damps the per-pixel blend on noisy estimates without requiring a history buffer, reprojection, or disocclusion handling.
+Before the blend is scaled by AA_STRENGTH, it is soft-pulled toward 0.5 on pixels where the local estimate is unreliable. Reliability is `clamp(consensus * lerp(0.5, 1.0, coherence), 0, 1)`; damp is `lerp(STABILITY_FLOOR, 1.0, reliability)`; blend becomes `lerp(0.5, blend, damp)`. Reliable pixels (`reliability ≈ 1`) keep their full blend. Unreliable pixels (`reliability ≈ 0`) keep only `STABILITY_FLOOR` of their blend delta, biased toward the midpoint. This is the local, history-free analogue of temporal hysteresis: it damps the per-pixel blend on noisy estimates without requiring a history buffer, reprojection, or disocclusion handling.
 
 **Kernel mix**
 
-kernelPref7 = strength7 / (strength5 + strength7), boosted by longEdgeFactor × angleQuality, then smoothstepped over `[KERNEL_MIX_LO, KERNEL_MIX_HI]` (default `[0.10, 0.75]`). Confident long edges get the long 7×7 kernel; short and fine features get the 5×5.
+`kernelPref7 = strength7 / (strength5 + strength7)`, boosted by longEdgeFactor × angleQuality, then smoothstepped over `[KERNEL_MIX_LO, KERNEL_MIX_HI]` (default `[0.10, 0.75]`). Confident long edges get the long 7×7 kernel; short and fine features get the 5×5.
 
 The transition range is deliberately wide. A narrow ramp on a noisy quantity like `strength7/(strength5+strength7)` causes per-pixel flicker near the crossover; widening it trades a little selectivity for a much smoother derivative of kernelMix with respect to the underlying strengths, so the mixed kernel evolves continuously instead of snapping.
 
@@ -143,31 +131,31 @@ Each tap weight is kernelWeight × dirWeight × stopWeight.
 |------|---------|---------|
 | Kernel weight | Radial falloff: 9/2 for 5×5, 24/12/3 for 7×7; scaled by kernelMix | Tap falloff |
 | dirWeight | smoothstep(dirAlignMin, dirAlignMax, dot(centerTangent, sampleTangent)) | Down-weights neighbors whose tangent points differently — the primary guard against bleeding across edges and corners |
-| stopWeight | 1 / (1 + 2x²) where x = relJump(sample, center) × COLOR_SENSITIVITY, relaxed by sampleEdge | Suppresses taps with large **relative** color differences; relaxation prevents halos |
+| stopWeight | 1 / (1 + 2x²) where x = max3(abs(sample − center)) × COLOR_SENSITIVITY, relaxed by sampleEdge | Suppresses taps with large absolute color differences; relaxation prevents halos |
 
-stopWeight uses the same Weber-relative measure as the consensus gates, so a tap across a near-white boundary is down-weighted by its *proportional* color jump rather than its absolute one. Without this, near-white boundaries would see full-weight taps and the along-edge average would bleed across them.
+`stopWeight` uses the same absolute per-channel difference as the consensus gates. The guard against near-white boundaries comes from the adaptive knee in the strength, not from the stop gate.
 
 dirWeight guards against degenerate tangents: if the center tangent's squared length is below `1e-6`, `dirAlign` defaults to 1.0 rather than being driven by a meaningless dot product. Same guard for both kernels.
 
-dirAlignMin is relaxed toward 0.55 on oblique edges (lerp(0.55, 0.7, angleQuality)) to admit more oblique-aligned neighbors without opening the gate on corners.
+dirAlignMin is relaxed toward 0.55 on oblique edges (`lerp(0.55, 0.7, angleQuality)`) to admit more oblique-aligned neighbors without opening the gate on corners.
 
 **Final blend**
 
-The center is preloaded with a large initial weight of 16 to 32 (by kernelMix), keeping the result near the original unless neighbors strongly agree. finalColor = acc / totalWeight, output = lerp(centerColor, finalColor, blend). The final blend is clamped to `[0, 1]` by the stability damping and the scaling step, so `AA_STRENGTH` values above 1 remain safe.
+The center is preloaded with a large initial weight of 16 to 32 (by kernelMix), keeping the result near the original unless neighbors strongly agree. `finalColor = acc / totalWeight`, output = `lerp(centerColor, finalColor, blend)`. The final blend is clamped to `[0, 1]` by the stability damping and the scaling step, so `AA_STRENGTH` values above 1 remain safe.
 
 ---
 
 ## Key Design Choices
 
-**Scale invariance.** Every stage uses a relative measure. The consensus gates compute Weber-relative color jumps, the tensors normalize by weight sum (in Step 2) and gradient scale (in Step 3), and the edge-stop weight is also Weber-relative. Combined with sub-texel sampling steps, this makes Cake AA functional as subpixel AA and lets it respond to boundaries between two near-white or two near-black bodies that an absolute-difference detector would miss.
+**Scale invariance.** The tensors normalize by weight sum (in Step 2) and gradient scale (in Step 3), and the edge strength uses an adaptive knee on center luminance. Combined with sub-texel sampling steps, this makes Cake AA functional as subpixel AA and lets the strength and blend respond proportionally to structure at any brightness level. Detection (the consensus gates and `edge_stop_weight`) is absolute; the near-white / near-black robustness comes from the knee downstream of it.
 
 **Two complementary kernels.** Rotated 5×5 and axis-aligned 7×7. The 7×7's side length is 1.4× the 5×5's, giving it proportionally larger reach; the 5×5's rotated grid resolves diagonals that the 7×7 resolves poorly, and vice versa. The 5×5 uses an iso-diamond radial weight profile, so its support is rotationally symmetric on the diamond lattice rather than rotated-square biased.
 
-**Consensus gating.** The cheap three-gate AND detector skips most pixels — including flat regions and noise — before the expensive tensor loops. Gate 1's distance-2 footprint keeps the AND discriminating, and the relative measure adds a second axis of discrimination: the AND fires on proportional contrast, so it doesn't collapse on bright content the way an absolute-difference AND does.
+**Consensus gating.** The cheap three-gate AND detector skips most pixels — including flat regions and noise — before the expensive tensor loops. Gate 1's distance-2 footprint keeps the AND discriminating.
 
 **Along-tangent-only blur.** The filter never samples perpendicular to the local edge, so it smooths along edges, not across them.
 
-**Layered artifact prevention.** Corner damping in the blend strength pulls back overall on low-coherence pixels, per-tap direction alignment rejects disagreeing neighbors, and edge-stop rejects large relative color jumps. These are three complementary guards. Stability damping is a fourth: it soft-pulls the blend toward 0.5 on pixels whose consensus and coherence are both weak, suppressing sub-pixel crawl from noisy strengths without a history buffer.
+**Layered artifact prevention.** Corner damping in the blend strength pulls back overall on low-coherence pixels, per-tap direction alignment rejects disagreeing neighbors, and edge-stop rejects large color jumps. These are three complementary guards. Stability damping is a fourth: it soft-pulls the blend toward 0.5 on pixels whose consensus and coherence are both weak, suppressing sub-pixel crawl from noisy strengths without a history buffer.
 
 **Adaptive everything.** Knee adapts to luminance, blend adapts to strength / coherence / angle, kernel mix adapts to which tensor dominates, and step size adapts to coherence and angle quality. The result is aggressive on clean, long, axis-aligned edges and conservative on corners, fine detail, and oblique boundaries.
 
@@ -194,7 +182,7 @@ Cake does not require SMAA or in-game non-temporal AA earlier in the pipeline, b
 - **Post-process AA (SMAA preferred over FXAA for sharpness).** SMAA's pattern-based edge reconstruction preserves more detail and introduces less blur than FXAA's single-pass luma blur, so it can cover edge cases Cake would miss — very thin sub-pixel features below Cake's consensus gate, or edges whose chroma signature is too subtle for the jump gates — without eroding sharpness.
 - **Information-dense AA (MSAA, SSAA).** A cleaner, less aliased input with fewer spurious high-frequency edges means Cake's consensus pre-filter sees more genuine structure and less single-pixel noise, and its tensors resolve cleaner gradients.
 
-Either way, Cake's along-tangent-only, scale-invariant behavior composes well: it refines and extends whatever edge information the earlier stage leaves, rather than fighting it.
+Either way, Cake's along-tangent-only behavior composes well: it refines and extends whatever edge information the earlier stage leaves, rather than fighting it.
 
 ---
 
@@ -202,48 +190,38 @@ Either way, Cake's along-tangent-only, scale-invariant behavior composes well: i
 
 ### Edge sensitivity (gate 1)
 
-EDGE_SENSITIVITY (default **12.0**) scales gate 1's distance-2 **relative** color jump. Higher values make gate 1 fire on smaller relative color deltas.
+`EDGE_SENSITIVITY` (default **4.0**) scales gate 1's distance-2 color jump. Higher values make gate 1 fire on smaller absolute color deltas.
 
-Because REV 3 changed the gate from absolute to Weber-relative, the tuning bands are in different units from earlier revisions — old absolute-unit values (4.0, 6.0, etc.) do not transfer.
-
-- Conservative: ~8–10
-- Default: 12.0
-- Aggressive: ~12–16
-- Above ~16, gate 1 saturates on most non-flat content and stops discriminating; the detector effectively becomes the two-gate AND
+- Conservative: ~2–3
+- Default: 4.0
+- Aggressive: ~5–8
+- Above ~8, gate 1 saturates on most non-flat content and stops discriminating; the detector effectively becomes the two-gate AND
 
 ### Consensus floor
 
-MIN_CONSENSUS_EDGE (default 0.10) gates the whole consensus on max(edge1, edge2, edge3). Lowering it admits pixels where all three gates are only moderately strong — the real lever for more sensitivity once gate 1 is near saturation.
-
-- Original: 0.15
-- Default: 0.10
+`MIN_CONSENSUS_EDGE` (default 0.10) gates the whole consensus on max(edge1, edge2, edge3). Lowering it admits pixels where all three gates are only moderately strong — the real lever for more sensitivity once gate 1 is near saturation.
 
 ### Color sensitivity
 
-COLOR_SENSITIVITY (default 7.0) controls edge_stop_weight. Higher values suppress taps with larger **relative** color deltas more aggressively; lower values make the filter more forgiving of near-edge color differences.
+`COLOR_SENSITIVITY` (default 7.0) controls `edge_stop_weight`. Higher values suppress taps with larger absolute color deltas more aggressively; lower values make the filter more forgiving of near-edge color differences.
 
-- Original (absolute units): 8.0
-- Default (relative units): 7.0
 - If grain near edges persists: step down toward 6.5
 - If halos appear: step up toward 7.5
 
 ### Jump-gate sensitivity
 
-JUMP_GAIN_EDGE (default **10.0**) scales the axial and diagonal **relative** jump gates in pass 1 (edge2 and edge3). Lower values make the gates require a larger relative color jump before they fire, suppressing grainy detail close to edges at the detection stage.
+`JUMP_GAIN_EDGE` (default **3.0**) scales the axial and diagonal jump gates in pass 1 (edge2 and edge3). Lower values make the gates require a larger color jump before they fire, suppressing grainy detail close to edges at the detection stage.
 
-As with EDGE_SENSITIVITY, the relative-unit default and bands differ from earlier revisions; old absolute-unit values do not transfer.
-
-- Conservative: ~8
-- Default: 10.0
-- Aggressive: ~10–12
-- If grain near edges persists: step down toward 8
-- If faint thin edges start to disappear: step up toward 12
+- Conservative: ~2
+- Default: 3.0
+- Aggressive: ~3–4
+- If grain near edges persists: step down toward 2
+- If faint thin edges start to disappear: step up toward 4
 
 ### Kernel-mix transition
 
 `KERNEL_MIX_LO` (default 0.10) and `KERNEL_MIX_HI` (default 0.75) set the smoothstep bounds on the kernelMix quantity. A narrower range increases selectivity between the two kernels; a wider range smooths the crossover and reduces per-pixel flicker at the boundary.
 
-- Widened from the original `[0.15, 0.65]` for temporal stability
 - If 5×5/7×7 selection looks sluggish: narrow toward `[0.15, 0.65]`
 - If flicker persists at the crossover: widen toward `[0.05, 0.85]`
 
@@ -258,7 +236,7 @@ As with EDGE_SENSITIVITY, the relative-unit default and bands differ from earlie
 
 ### Corner damping
 
-CORNER_CONFIDENCE_FLOOR controls the corner-damping mechanism. The floor sets the confidence multiplier at zero coherence; it scales up to 1.0 with coherence. Lower values damp corners more aggressively; higher values reduce the damping. At the default 1.0 the mechanism is disabled (multiplier is always 1.0); set to ~0.85 to activate.
+`CORNER_CONFIDENCE_FLOOR` controls the corner-damping mechanism. The floor sets the confidence multiplier at zero coherence; it scales up to 1.0 with coherence. Lower values damp corners more aggressively; higher values reduce the damping. At the default 1.0 the mechanism is disabled (multiplier is always 1.0); set to ~0.85 to activate.
 
 ---
 
@@ -266,22 +244,22 @@ CORNER_CONFIDENCE_FLOOR controls the corner-damping mechanism. The floor sets th
 
 CakeAA.fx
 
-- PostProcessVS — fullscreen vertex shader
+- `PostProcessVS` — fullscreen vertex shader
 - UI Controls — Debug toggle
 - Parameters — tuning constants
 - Textures / Samplers — backbuffer + four edge data targets
-- Utility functions — max3, rel_jump (Weber-relative per-channel contrast), kernel tables (`DIAMOND_W`, `KERNEL_7x7`), DEG2RAD
-- fast_edge_consensus — three-gate AND detector, using rel_jump on all three gates
-- compute_all_tensors — fused 5×5 (iso-diamond) and 7×7 (separable binomial) tensor bodies; normalizes internally, returns normalized gradients only
-- normalize_and_regularize_tensor — epsilon + gradient-scale normalization (weight-sum normalization happens in compute_all_tensors)
-- decompose_structure_tensor
-- compute_angle_quality
-- compute_adaptive_blend
-- apply_stability_damping — local, history-free blend damping on unreliable pixels
-- PS_DetectEdges — pass 1
-- edge_stop_weight — Weber-relative color-stop gate for AA taps
-- PS_ApplyAA — pass 2
-- technique CakeAA — EdgeDetection + AntiAliasing passes
+- Utility functions — `max3`, kernel tables (`DIAMOND_W`, `KERNEL_7x7`), DEG2RAD
+- `fast_edge_consensus` — three-gate AND detector, absolute per-channel difference
+- `compute_all_tensors` — fused 5×5 (iso-diamond) and 7×7 (separable binomial) tensor bodies; normalizes internally, returns normalized gradients only
+- `normalize_and_regularize_tensor` — epsilon + gradient-scale normalization (weight-sum normalization happens in `compute_all_tensors`)
+- `decompose_structure_tensor`
+- `compute_angle_quality`
+- `compute_adaptive_blend`
+- `apply_stability_damping` — local, history-free blend damping on unreliable pixels
+- `PS_DetectEdges` — pass 1
+- `edge_stop_weight` — absolute per-channel color-stop gate for AA taps
+- `PS_ApplyAA` — pass 2
+- `technique CakeAA` — EdgeDetection + AntiAliasing passes
 
 ---
 
