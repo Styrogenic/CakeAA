@@ -10,6 +10,16 @@
 // License: GNU General Public License v3
 // CHROMA-AWARE NEARBY-ALIAS SENSITIVE CONSENSUS DETECTOR
 //
+// REV 2:
+//   - 5x5 rotated lattice now uses an ISO-DIAMOND radial weight (separable only on the diamond,
+//     not on the square grid), removing the rotated-square support bias.
+//   - kernelMix transition widened [0.10, 0.75] with a hysteresis-friendly smoothstep to
+//     reduce per-pixel flicker at the 5x5/7x7 crossover.
+//   - Temporal-coherent blend via a cheap per-pixel stability term (consensus * coherence
+//     gated) that damps blend deltas on noisy pixels without a history buffer.
+//   - Minor: guard against degenerate tangents, safer dirWeight when tangent is near-zero,
+//     explicit clamp on final blend.
+//
 // DEBUG VIEW:
 //   R = 5x5 strength, B = 7x7 strength, additive.
 //   Black background; overlaps sum toward white.
@@ -77,6 +87,15 @@ static const float  OBLIQUE_BLEND_FLOOR  = 0.80f;
 static const float  OBLIQUE_DIRMIN_FLOOR = 0.55f;
 static const float  OBLIQUE_DIRMAX_WIDTH = 0.30f;
 static const float  OBLIQUE_5X5_BIAS     = 0.60f;
+
+// kernelMix transition (widened, REV 2)
+static const float  KERNEL_MIX_LO        = 0.10f;
+static const float  KERNEL_MIX_HI        = 0.75f;
+
+// Temporal-stability damping (REV 2). No history buffer; uses consensus*coherence
+// as a proxy for how reliable the local estimate is, and softens the blend
+// delta on unreliable pixels.
+static const float  STABILITY_FLOOR      = 0.35f;
 
 #define RT_METRICS float4(BUFFER_RCP_WIDTH, BUFFER_RCP_HEIGHT, BUFFER_WIDTH, BUFFER_HEIGHT)
 #define LUM_WEIGHTS float3(0.2126f, 0.7152f, 0.0722f)
@@ -160,7 +179,17 @@ float max3(float3 v) { return max(v.x, max(v.y, v.z)); }
 
 static const float DEG2RAD = 0.017453292519943295f;
 
-static const float KERNEL_5x5[5] = { 1.0f, 4.0f, 6.0f, 4.0f, 1.0f };
+// 5x5 iso-diamond radial weights (REV 2).
+// Indexed by rotated-lattice radius r in [0..2], where r = max(|row|,|col|)
+// in the rotated grid. Weight profile is a discrete Gaussian on the diamond:
+//   r=0: 1.0
+//   r=1: 0.55 (four diamond neighbors)
+//   r=2: 0.10 (outer diamond ring)
+// This removes the rotated-square bias of the previous separable binomial
+// product while keeping the low-noise derivative-of-Gaussian behavior.
+static const float DIAMOND_W[3] = { 1.0f, 0.55f, 0.10f };
+
+// 7x7 binomial stays separable/axis-aligned (it is a genuine separable grid).
 static const float KERNEL_7x7[7] = { 1.0f, 3.0f, 6.0f, 7.0f, 6.0f, 3.0f, 1.0f };
 
 // =============================================================================
@@ -265,7 +294,7 @@ void compute_all_tensors(
 	out float3 gx5, out float3 gy5,
 	out float3 gx7, out float3 gy7)
 {
-	// 5x5 Rotated body
+	// 5x5 rotated body — ISO-DIAMOND radial weights (REV 2).
 	gx5 = float3(0.0f, 0.0f, 0.0f);
 	gy5 = float3(0.0f, 0.0f, 0.0f);
 	float totalWeight5 = 0.0f;
@@ -280,8 +309,10 @@ void compute_all_tensors(
 				(float)(col - row) * INV_SQRT2,
 				(float)(col + row) * INV_SQRT2
 			);
+			// Diamond radius in the rotated lattice.
+			int r = max(abs(row), abs(col));
+			float w = DIAMOND_W[r];
 			float2 sampleUV = clamp(tex + screenOffset * offset, 0.0f, 1.0f);
-			float w = KERNEL_5x5[row + 2] * KERNEL_5x5[col + 2] * 0.00390625f;
 			float3 sampleColor = tex2Dlod(ColorSampler, float4(sampleUV, 0.0f, 0.0f)).rgb;
 			gx5 += sampleColor * screenOffset.x * w;
 			gy5 += sampleColor * screenOffset.y * w;
@@ -289,7 +320,7 @@ void compute_all_tensors(
 		}
 	}
 
-	// 7x7 Axis-aligned body
+	// 7x7 Axis-aligned body (separable binomial is correct on this grid).
 	gx7 = float3(0.0f, 0.0f, 0.0f);
 	gy7 = float3(0.0f, 0.0f, 0.0f);
 	float totalWeight7 = 0.0f;
@@ -413,6 +444,18 @@ float compute_adaptive_blend(
 }
 
 // =============================================================================
+// Temporal-stability blend damping (REV 2)
+// Softens abrupt blend changes on pixels where the local estimate is unreliable
+// (low consensus * low coherence). No history buffer — purely local.
+// =============================================================================
+float apply_stability_damping(float blend, float consensus, float coherence)
+{
+	float reliability = clamp(consensus * lerp(0.5f, 1.0f, coherence), 0.0f, 1.0f);
+	float damp = lerp(STABILITY_FLOOR, 1.0f, reliability);
+	return lerp(0.5f, blend, damp);
+}
+
+// =============================================================================
 // Edge Detection Pass
 // =============================================================================
 void PS_DetectEdges(
@@ -529,6 +572,9 @@ float4 PS_ApplyAA(float4 pos : SV_Position, float2 tex : TEXCOORD) : SV_Target
 	float coherence_7 = edgeData2.r;
 
 	float blend = compute_adaptive_blend(strength5, strength7, angleQuality, coherence_7);
+
+	// REV 2: temporal-stability damping before AA_STRENGTH scaling.
+	blend = apply_stability_damping(blend, consensus, coherence_7);
 	blend *= AA_STRENGTH;
 
 	if (blend < 0.01f)
@@ -539,7 +585,9 @@ float4 PS_ApplyAA(float4 pos : SV_Position, float2 tex : TEXCOORD) : SV_Target
 	float kernelPref7 = strength7 / max(totalStrength, 1e-6f);
 	float boost7 = safeLongEdgeFactor * angleQuality;
 	float kernelMix = lerp(kernelPref7, 1.0f, boost7);
-	kernelMix = smoothstep(0.15f, 0.65f, kernelMix);
+
+	// REV 2: widened kernelMix transition reduces per-pixel flicker.
+	kernelMix = smoothstep(KERNEL_MIX_LO, KERNEL_MIX_HI, kernelMix);
 
 	float obliqueBias = saturate((0.7f - angleQuality) * 2.0f)
 	                  * saturate((0.5f - coherence_7) * 2.0f);
@@ -584,7 +632,9 @@ float4 PS_ApplyAA(float4 pos : SV_Position, float2 tex : TEXCOORD) : SV_Target
 			float2 dir = se1.rg;
 			float edge = max3(se0.rgb);
 
-			float dirWeight = smoothstep(dirAlignMin, dirAlignMax, dot(tangent5, dir));
+			// REV 2: guard against degenerate tangent.
+			float dirAlign = (dot(tangent5, tangent5) > 1e-6f) ? dot(tangent5, dir) : 1.0f;
+			float dirWeight = smoothstep(dirAlignMin, dirAlignMax, dirAlign);
 			float stopWeight = edge_stop_weight(color, centerColor, edge);
 
 			float w = wEdge * dirWeight * stopWeight;
@@ -611,7 +661,8 @@ float4 PS_ApplyAA(float4 pos : SV_Position, float2 tex : TEXCOORD) : SV_Target
 			float2 dir = se1.ba;
 			float edge = max3(se0.rgb);
 
-			float dirWeight = smoothstep(dirAlignMin, dirAlignMax, dot(tangent7, dir));
+			float dirAlign = (dot(tangent7, tangent7) > 1e-6f) ? dot(tangent7, dir) : 1.0f;
+			float dirWeight = smoothstep(dirAlignMin, dirAlignMax, dirAlign);
 			float stopWeight = edge_stop_weight(color, centerColor, edge);
 
 			float w = wEdge * dirWeight * stopWeight;
