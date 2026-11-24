@@ -20,21 +20,13 @@
 //   - Minor: guard against degenerate tangents, safer dirWeight when tangent is near-zero,
 //     explicit clamp on final blend.
 //
-// REV 3:
-//   - Removed luminance-adaptive knee. The knee is now a constant, so the detector no longer
-//     discriminates between near-white and near-black pixels (previously it was more
-//     sensitive near black due to the max(luma, 0.02) floor). RELATIVE_KNEE is retained
-//     as the constant knee value; LUM_WEIGHTS is no longer used by the strength path.
-//
-// REV 4 (low-contrast fix):
-//   - Consensus is now a soft geometric-mean AND gate instead of a hard product. A hard
-//     product required all three gates to be independently strong at once, which killed
-//     low-contrast edges (sub-10% delta) even when all three gates were moderately positive.
-//   - JUMP_GAIN_EDGE raised 3.0 -> 6.0 to distance-normalize the 1px axial/diagonal jump
-//     gates to Gate 1's distance-2 color-delta scale, so weak edges register equally.
-//   - MIN_CONSENSUS_EDGE lowered 0.10 -> 0.05 and min-edge smoothstep widened to admit
-//     genuinely low-contrast consensus while still rejecting flat noise.
-//   - Threshold smoothstep lower edge widened (0.5 -> 0.35) for hysteresis-friendly pickup.
+// REV 3 (low-contrast fix):
+//   - Consensus is now a GEOMETRIC MEAN of the three gates instead of a raw product,
+//     so low-contrast edges that satisfy all gates weakly still survive.
+//   - Gates are CONTRAST-RELATIVE: per-pixel gain scales up in dark / low-luma regions.
+//   - MIN_CONSENSUS_EDGE floor is now relative to local contrast, not absolute.
+//   - Gate 1 (distance-2) can carry weak edges alone; gates 2/3 boost rather than AND-kill.
+//   - Early-out thresholds lowered and made relative.
 //
 // DEBUG VIEW:
 //   R = 5x5 strength, B = 7x7 strength, additive.
@@ -75,15 +67,22 @@ uniform bool Debug <
 
 // ================================ Parameters ================================
 static const float  AA_STRENGTH          = 1.0f;
-static const float  RELATIVE_KNEE        = 0.005f;  // now used as a constant, luminance-independent knee
+static const float  RELATIVE_KNEE        = 0.005f;
 static const float  NORMALIZED_DIST      = 3.5f;
 static const float  COLOR_SENSITIVITY    = 7.0f;   // edge-stop sensitivity in pass 2
 static const float  DIRECTION_ALIGNMENT_MIN = 0.7f;
 static const float  MIN_COHERENCE        = 0.08f;
 
-static const float  CONSENSUS_THRESHOLD  = 0.6f;
-static const float  EDGE_SENSITIVITY     = 4.0f;   // gate 1 distance-2 gain
-static const float  MIN_CONSENSUS_EDGE   = 0.05f;  // REV 4: was 0.10 — admit low-contrast consensus
+// REV 3: consensus is a geometric mean, thresholds rescaled accordingly.
+static const float  CONSENSUS_LO         = 0.03f;  // geo-mean lower knee
+static const float  CONSENSUS_HI         = 0.10f;  // geo-mean upper knee
+static const float  EDGE_SENSITIVITY     = 4.0f;   // gate 1 distance-2 gain (relative)
+static const float  MIN_CONSENSUS_EDGE_LO = 0.02f; // relative floor, low contrast
+static const float  MIN_CONSENSUS_EDGE_HI = 0.06f; // relative floor, high contrast
+
+// Relative gain scaling: gain *= 1 / (GAIN_LUMA_BASE + luma)
+static const float  GAIN_LUMA_BASE       = 0.30f;
+static const float  GAIN_MAX             = 6.0f;   // clamp relative gain to avoid blowing up near-black
 
 static const float  QUALITY_TARGET_HIGH  = 0.98f;
 static const float  QUALITY_TARGET_LOW   = 0.65f;
@@ -96,9 +95,7 @@ static const float  QUALITY_CLAMP_MAX    = 0.98f;
 static const float  CORNER_CONFIDENCE_FLOOR = 1.0f;
 
 // Jump-gate gain for gates 2 and 3 (1px axial / diagonal).
-// REV 4: raised 3.0 -> 6.0 to distance-normalize 1px jumps to Gate 1's
-// distance-2 color-delta scale, so low-contrast edges register equally.
-static const float  JUMP_GAIN_EDGE       = 6.0f;
+static const float  JUMP_GAIN_EDGE       = 3.0f;
 
 // Oblique tuning
 static const float  OBLIQUE_BLEND_FLOOR  = 0.80f;
@@ -110,13 +107,12 @@ static const float  OBLIQUE_5X5_BIAS     = 0.60f;
 static const float  KERNEL_MIX_LO        = 0.10f;
 static const float  KERNEL_MIX_HI        = 0.75f;
 
-// Temporal-stability damping (REV 2). No history buffer; uses consensus*coherence
-// as a proxy for how reliable the local estimate is, and softens the blend
-// delta on unreliable pixels.
+// Temporal-stability damping (REV 2).
 static const float  STABILITY_FLOOR      = 0.35f;
 
-// REV 3: constant, luminance-independent knee (was adaptive in REV 2).
-static const float  ABSOLUTE_KNEE        = RELATIVE_KNEE;
+// REV 3: early-out floors (relative to consensus scale).
+static const float  EARLYOUT_DETECT      = 0.02f;
+static const float  EARLYOUT_APPLY       = 0.015f;
 
 #define RT_METRICS float4(BUFFER_RCP_WIDTH, BUFFER_RCP_HEIGHT, BUFFER_WIDTH, BUFFER_HEIGHT)
 #define LUM_WEIGHTS float3(0.2126f, 0.7152f, 0.0722f)
@@ -197,24 +193,18 @@ sampler EdgeDataSampler3
 // Utility functions
 // =============================================================================
 float max3(float3 v) { return max(v.x, max(v.y, v.z)); }
+float min3(float3 v) { return min(v.x, min(v.y, v.z)); }
 
 static const float DEG2RAD = 0.017453292519943295f;
 
 // 5x5 iso-diamond radial weights (REV 2).
-// Indexed by rotated-lattice radius r in [0..2], where r = max(|row|,|col|)
-// in the rotated grid. Weight profile is a discrete Gaussian on the diamond:
-//   r=0: 1.0
-//   r=1: 0.55 (four diamond neighbors)
-//   r=2: 0.10 (outer diamond ring)
-// This removes the rotated-square bias of the previous separable binomial
-// product while keeping the low-noise derivative-of-Gaussian behavior.
 static const float DIAMOND_W[3] = { 1.0f, 0.55f, 0.10f };
 
-// 7x7 binomial stays separable/axis-aligned (it is a genuine separable grid).
+// 7x7 binomial stays separable/axis-aligned.
 static const float KERNEL_7x7[7] = { 1.0f, 3.0f, 6.0f, 7.0f, 6.0f, 3.0f, 1.0f };
 
 // =============================================================================
-// FAST CONSENSUS EDGE DETECTOR — THREE-GATE AND
+// FAST CONSENSUS EDGE DETECTOR — THREE-GATE SOFT-MAX / GEO-MEAN (REV 3)
 // Gate 1: distance-2 color jump in 8 directions
 // Gate 2: 1px axial color jump
 // Gate 3: 1px diagonal color jump
@@ -268,8 +258,6 @@ float fast_edge_consensus(float2 tex, float2 offset, float3 centerColor)
 	d2 = max(d2, max3(abs(cSW2 - centerColor)));
 	d2 = max(d2, max3(abs(cSE2 - centerColor)));
 
-	float edge1 = saturate(d2 * EDGE_SENSITIVITY);
-
 	// =====================================================================
 	// GATE 2: 1px axial color jump
 	// =====================================================================
@@ -288,30 +276,67 @@ float fast_edge_consensus(float2 tex, float2 offset, float3 centerColor)
 	float dgSE = max3(abs(cSE - centerColor));
 	float diagJump = max(max(dgNW, dgNE), max(dgSW, dgSE));
 
-	float edge2 = saturate(axialJump * JUMP_GAIN_EDGE);
-	float edge3 = saturate(diagJump  * JUMP_GAIN_EDGE);
+	// =====================================================================
+	// REV 3: contrast-relative gains.
+	// Estimate local contrast from the 3x3 luma range + center luma.
+	// Dark or flat regions get more gain so weak jumps still register.
+	// =====================================================================
+	float lumaC = dot(centerColor, LUM_WEIGHTS);
+
+	float lumaN  = dot(cN,  LUM_WEIGHTS);
+	float lumaS  = dot(cS,  LUM_WEIGHTS);
+	float lumaE  = dot(cE,  LUM_WEIGHTS);
+	float lumaW  = dot(cW,  LUM_WEIGHTS);
+	float lumaNW = dot(cNW, LUM_WEIGHTS);
+	float lumaNE = dot(cNE, LUM_WEIGHTS);
+	float lumaSW = dot(cSW, LUM_WEIGHTS);
+	float lumaSE = dot(cSE, LUM_WEIGHTS);
+
+	float lumaMax9 = max(lumaC, max(max(lumaN, lumaS), max(max(lumaE, lumaW),
+	                    max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)))));
+	float lumaMin9 = min(lumaC, min(min(lumaN, lumaS), min(min(lumaE, lumaW),
+	                    min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)))));
+	float localRange = lumaMax9 - lumaMin9;
+
+	// Combine absolute luma and local range into the gain denominator.
+	// Dark pixels (low luma) and flat neighborhoods (low range) both need more gain,
+	// but we clamp so near-black noise doesn't explode.
+	float gainDenom = GAIN_LUMA_BASE + max(lumaC, 0.0f) + localRange * 0.5f;
+	float gainScale = saturate(1.0f / max(gainDenom, 1e-4f) * GAIN_LUMA_BASE);
+	gainScale = clamp(gainScale * (1.0f + localRange * 4.0f), 0.5f, GAIN_MAX);
+
+	float edge1 = saturate(d2        * EDGE_SENSITIVITY * gainScale);
+	float edge2 = saturate(axialJump * JUMP_GAIN_EDGE  * gainScale);
+	float edge3 = saturate(diagJump  * JUMP_GAIN_EDGE  * gainScale);
 
 	// =====================================================================
-	// AND-gate consensus (REV 4: soft geometric mean, was hard product)
-	// Geometric mean preserves low-contrast edges where all three gates are
-	// moderately positive, instead of requiring all three to be strong
-	// simultaneously (which the hard product demanded).
+	// REV 3 consensus: geometric mean of the three gates (survives weak-but-consistent edges),
+	// boosted by gate 2/3 agreement rather than AND-killed by it.
+	//   geoMean  = (e1*e2*e3)^(1/3)  -> tracks the TYPICAL gate value
+	//   gate23   = max(e2, e3)       -> adds 1px specificity when present
+	//   consensus= geoMean * lerp(0.4, 1.0, gate23)  -> gate1 can carry alone
 	// =====================================================================
-	float consensus = pow(edge1 * edge2 * edge3, 1.0f / 3.0f);
+	float geoMean = pow(max(edge1 * edge2 * edge3, 1e-8f), 1.0f / 3.0f);
+	float gate23  = max(edge2, edge3);
+	float consensus = geoMean * lerp(0.40f, 1.0f, gate23);
 
-	float threshold = CONSENSUS_THRESHOLD;
-	consensus = smoothstep(threshold * 0.35f, threshold * 1.5f, consensus);
+	// Soft knee on the geo-mean scale.
+	consensus = smoothstep(CONSENSUS_LO, CONSENSUS_HI, consensus);
 
-	// Require at least one reasonably strong gate (prevents uniform-area noise).
-	float minEdge = max(edge1, max(edge2, edge3));
-	consensus *= smoothstep(MIN_CONSENSUS_EDGE * 0.3f, MIN_CONSENSUS_EDGE * 1.2f, minEdge);
+	// REV 3 relative floor: scale the minimum-edge requirement with local contrast.
+	// A high-contrast region must clear a higher bar (less false positive);
+	// a low-contrast region clears a lower one (rescue weak edges).
+	float minEdge = max(edge1, gate23);
+	float floorLo = MIN_CONSENSUS_EDGE_LO;
+	float floorHi = MIN_CONSENSUS_EDGE_HI;
+	float floorEdge = lerp(floorLo, floorHi, saturate(localRange * 4.0f));
+	consensus *= smoothstep(floorEdge * 0.5f, floorEdge * 1.5f, minEdge);
 
-	return consensus;
+	return saturate(consensus);
 }
 
 // =============================================================================
-// FUSED TENSOR COMPUTATION (5x5 + 7x7) — normalizes internally, returns
-// gradient sums only (no separate weight out-params).
+// FUSED TENSOR COMPUTATION (5x5 + 7x7)
 // =============================================================================
 void compute_all_tensors(
 	float2 tex,
@@ -335,7 +360,6 @@ void compute_all_tensors(
 				(float)(col - row) * INV_SQRT2,
 				(float)(col + row) * INV_SQRT2
 			);
-			// Diamond radius in the rotated lattice.
 			int r = max(abs(row), abs(col));
 			float w = DIAMOND_W[r];
 			float2 sampleUV = clamp(tex + screenOffset * offset, 0.0f, 1.0f);
@@ -346,7 +370,7 @@ void compute_all_tensors(
 		}
 	}
 
-	// 7x7 Axis-aligned body (separable binomial is correct on this grid).
+	// 7x7 Axis-aligned body.
 	gx7 = float3(0.0f, 0.0f, 0.0f);
 	gy7 = float3(0.0f, 0.0f, 0.0f);
 	float totalWeight7 = 0.0f;
@@ -366,7 +390,6 @@ void compute_all_tensors(
 		}
 	}
 
-	// Normalize inline (lossless — same ops as before, just not passed out)
 	if (totalWeight5 > 0.0f) { float inv = 1.0f / totalWeight5; gx5 *= inv; gy5 *= inv; }
 	if (totalWeight7 > 0.0f) { float inv = 1.0f / totalWeight7; gx7 *= inv; gy7 *= inv; }
 }
@@ -471,8 +494,6 @@ float compute_adaptive_blend(
 
 // =============================================================================
 // Temporal-stability blend damping (REV 2)
-// Softens abrupt blend changes on pixels where the local estimate is unreliable
-// (low consensus * low coherence). No history buffer — purely local.
 // =============================================================================
 float apply_stability_damping(float blend, float consensus, float coherence)
 {
@@ -497,7 +518,8 @@ void PS_DetectEdges(
 
 	float consensus = fast_edge_consensus(tex, offset, centerColor);
 
-	if (consensus < 0.1f) {
+	// REV 3: lowered early-out; consensus math now produces meaningful small values.
+	if (consensus < EARLYOUT_DETECT) {
 		out0 = float4(0.0f, 0.0f, 0.0f, 0.0f);
 		out1 = float4(0.0f, 0.0f, 0.0f, 0.0f);
 		out2 = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -528,10 +550,7 @@ void PS_DetectEdges(
 	float2 tangent7;
 	decompose_structure_tensor(S11_7, S12_7, S22_7, lambda1_7, lambda2_7, tangent7);
 
-	// REV 3: constant, luminance-independent knee.
-	// (Removed the previous RELATIVE_KNEE * max(luma, 0.02) adaptive scaling,
-	//  which made the detector more sensitive near black than near white.)
-	float adaptedKnee = ABSOLUTE_KNEE;
+	float adaptedKnee = RELATIVE_KNEE * max(dot(centerColor, LUM_WEIGHTS), 0.02f);
 
 	float meanGradMag_5 = sqrt(max(lambda1_5 + lambda2_5, 0.0f));
 	float meanGradMag_7 = sqrt(max(lambda1_7 + lambda2_7, 0.0f));
@@ -585,7 +604,8 @@ float4 PS_ApplyAA(float4 pos : SV_Position, float2 tex : TEXCOORD) : SV_Target
 
 	float3 centerColor = tex2D(ColorSampler, tex).rgb;
 
-	if (consensus < 0.05f) {
+	// REV 3: lowered early-out.
+	if (consensus < EARLYOUT_APPLY) {
 		return float4(centerColor, 1.0f);
 	}
 
@@ -602,7 +622,6 @@ float4 PS_ApplyAA(float4 pos : SV_Position, float2 tex : TEXCOORD) : SV_Target
 
 	float blend = compute_adaptive_blend(strength5, strength7, angleQuality, coherence_7);
 
-	// REV 2: temporal-stability damping before AA_STRENGTH scaling.
 	blend = apply_stability_damping(blend, consensus, coherence_7);
 	blend *= AA_STRENGTH;
 
@@ -615,7 +634,6 @@ float4 PS_ApplyAA(float4 pos : SV_Position, float2 tex : TEXCOORD) : SV_Target
 	float boost7 = safeLongEdgeFactor * angleQuality;
 	float kernelMix = lerp(kernelPref7, 1.0f, boost7);
 
-	// REV 2: widened kernelMix transition reduces per-pixel flicker.
 	kernelMix = smoothstep(KERNEL_MIX_LO, KERNEL_MIX_HI, kernelMix);
 
 	float obliqueBias = saturate((0.7f - angleQuality) * 2.0f)
@@ -661,7 +679,6 @@ float4 PS_ApplyAA(float4 pos : SV_Position, float2 tex : TEXCOORD) : SV_Target
 			float2 dir = se1.rg;
 			float edge = max3(se0.rgb);
 
-			// REV 2: guard against degenerate tangent.
 			float dirAlign = (dot(tangent5, tangent5) > 1e-6f) ? dot(tangent5, dir) : 1.0f;
 			float dirWeight = smoothstep(dirAlignMin, dirAlignMax, dirAlign);
 			float stopWeight = edge_stop_weight(color, centerColor, edge);
