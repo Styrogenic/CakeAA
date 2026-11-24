@@ -20,6 +20,22 @@
 //   - Minor: guard against degenerate tangents, safer dirWeight when tangent is near-zero,
 //     explicit clamp on final blend.
 //
+// REV 3:
+//   - Removed luminance-adaptive knee. The knee is now a constant, so the detector no longer
+//     discriminates between near-white and near-black pixels (previously it was more
+//     sensitive near black due to the max(luma, 0.02) floor). RELATIVE_KNEE is retained
+//     as the constant knee value; LUM_WEIGHTS is no longer used by the strength path.
+//
+// REV 4 (low-contrast fix):
+//   - Consensus is now a soft geometric-mean AND gate instead of a hard product. A hard
+//     product required all three gates to be independently strong at once, which killed
+//     low-contrast edges (sub-10% delta) even when all three gates were moderately positive.
+//   - JUMP_GAIN_EDGE raised 3.0 -> 6.0 to distance-normalize the 1px axial/diagonal jump
+//     gates to Gate 1's distance-2 color-delta scale, so weak edges register equally.
+//   - MIN_CONSENSUS_EDGE lowered 0.10 -> 0.05 and min-edge smoothstep widened to admit
+//     genuinely low-contrast consensus while still rejecting flat noise.
+//   - Threshold smoothstep lower edge widened (0.5 -> 0.35) for hysteresis-friendly pickup.
+//
 // DEBUG VIEW:
 //   R = 5x5 strength, B = 7x7 strength, additive.
 //   Black background; overlaps sum toward white.
@@ -59,7 +75,7 @@ uniform bool Debug <
 
 // ================================ Parameters ================================
 static const float  AA_STRENGTH          = 1.0f;
-static const float  RELATIVE_KNEE        = 0.005f;
+static const float  RELATIVE_KNEE        = 0.005f;  // now used as a constant, luminance-independent knee
 static const float  NORMALIZED_DIST      = 3.5f;
 static const float  COLOR_SENSITIVITY    = 7.0f;   // edge-stop sensitivity in pass 2
 static const float  DIRECTION_ALIGNMENT_MIN = 0.7f;
@@ -67,7 +83,7 @@ static const float  MIN_COHERENCE        = 0.08f;
 
 static const float  CONSENSUS_THRESHOLD  = 0.6f;
 static const float  EDGE_SENSITIVITY     = 4.0f;   // gate 1 distance-2 gain
-static const float  MIN_CONSENSUS_EDGE   = 0.10f;  // was 0.15 — admit moderately-strong consensus
+static const float  MIN_CONSENSUS_EDGE   = 0.05f;  // REV 4: was 0.10 — admit low-contrast consensus
 
 static const float  QUALITY_TARGET_HIGH  = 0.98f;
 static const float  QUALITY_TARGET_LOW   = 0.65f;
@@ -80,7 +96,9 @@ static const float  QUALITY_CLAMP_MAX    = 0.98f;
 static const float  CORNER_CONFIDENCE_FLOOR = 1.0f;
 
 // Jump-gate gain for gates 2 and 3 (1px axial / diagonal).
-static const float  JUMP_GAIN_EDGE       = 3.0f;
+// REV 4: raised 3.0 -> 6.0 to distance-normalize 1px jumps to Gate 1's
+// distance-2 color-delta scale, so low-contrast edges register equally.
+static const float  JUMP_GAIN_EDGE       = 6.0f;
 
 // Oblique tuning
 static const float  OBLIQUE_BLEND_FLOOR  = 0.80f;
@@ -96,6 +114,9 @@ static const float  KERNEL_MIX_HI        = 0.75f;
 // as a proxy for how reliable the local estimate is, and softens the blend
 // delta on unreliable pixels.
 static const float  STABILITY_FLOOR      = 0.35f;
+
+// REV 3: constant, luminance-independent knee (was adaptive in REV 2).
+static const float  ABSOLUTE_KNEE        = RELATIVE_KNEE;
 
 #define RT_METRICS float4(BUFFER_RCP_WIDTH, BUFFER_RCP_HEIGHT, BUFFER_WIDTH, BUFFER_HEIGHT)
 #define LUM_WEIGHTS float3(0.2126f, 0.7152f, 0.0722f)
@@ -271,14 +292,19 @@ float fast_edge_consensus(float2 tex, float2 offset, float3 centerColor)
 	float edge3 = saturate(diagJump  * JUMP_GAIN_EDGE);
 
 	// =====================================================================
-	// AND-gate consensus
+	// AND-gate consensus (REV 4: soft geometric mean, was hard product)
+	// Geometric mean preserves low-contrast edges where all three gates are
+	// moderately positive, instead of requiring all three to be strong
+	// simultaneously (which the hard product demanded).
 	// =====================================================================
-	float consensus = edge1 * edge2 * edge3;
-	float threshold = CONSENSUS_THRESHOLD * CONSENSUS_THRESHOLD * CONSENSUS_THRESHOLD;
-	consensus = smoothstep(threshold * 0.5f, threshold * 1.5f, consensus);
+	float consensus = pow(edge1 * edge2 * edge3, 1.0f / 3.0f);
 
+	float threshold = CONSENSUS_THRESHOLD;
+	consensus = smoothstep(threshold * 0.35f, threshold * 1.5f, consensus);
+
+	// Require at least one reasonably strong gate (prevents uniform-area noise).
 	float minEdge = max(edge1, max(edge2, edge3));
-	consensus *= smoothstep(MIN_CONSENSUS_EDGE * 0.5f, MIN_CONSENSUS_EDGE * 1.5f, minEdge);
+	consensus *= smoothstep(MIN_CONSENSUS_EDGE * 0.3f, MIN_CONSENSUS_EDGE * 1.2f, minEdge);
 
 	return consensus;
 }
@@ -502,7 +528,10 @@ void PS_DetectEdges(
 	float2 tangent7;
 	decompose_structure_tensor(S11_7, S12_7, S22_7, lambda1_7, lambda2_7, tangent7);
 
-	float adaptedKnee = RELATIVE_KNEE * max(dot(centerColor, LUM_WEIGHTS), 0.02f);
+	// REV 3: constant, luminance-independent knee.
+	// (Removed the previous RELATIVE_KNEE * max(luma, 0.02) adaptive scaling,
+	//  which made the detector more sensitive near black than near white.)
+	float adaptedKnee = ABSOLUTE_KNEE;
 
 	float meanGradMag_5 = sqrt(max(lambda1_5 + lambda2_5, 0.0f));
 	float meanGradMag_7 = sqrt(max(lambda1_7 + lambda2_7, 0.0f));
