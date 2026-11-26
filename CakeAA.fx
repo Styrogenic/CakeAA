@@ -20,6 +20,20 @@
 //   - Minor: guard against degenerate tangents, safer dirWeight when tangent is near-zero,
 //     explicit clamp on final blend.
 //
+// REV 3:
+//   - Amplitude-normalized AND consensus (smoothstep per gate) so low-contrast but
+//     geometrically-consistent stair-steps survive the product.
+//   - Directional-consistency rescue (axial concentration) admits low-contrast 1px
+//     steps ONLY when the local geometry is a genuine step, not texture/noise.
+//   - Downstream guards (higher COLOR_SENSITIVITY, higher STABILITY_FLOOR) prevent
+//     edge-noise and thickness increase from the newly admitted detections.
+//
+// REV 4:
+//   - 5x5 diamond weights now use the 1,4,6,4,1 binomial profile {6,4,1} by diamond ring,
+//     replacing the arbitrary {1.0,0.55,0.10}. This is the correct binomial coefficient
+//     sequence for a 5-tap kernel and makes the diamond a proper separable
+//     derivative-of-Gaussian on the rotated lattice.
+//
 // DEBUG VIEW:
 //   R = 5x5 strength, B = 7x7 strength, additive.
 //   Black background; overlaps sum toward white.
@@ -61,7 +75,7 @@ uniform bool Debug <
 static const float  AA_STRENGTH          = 1.0f;
 static const float  RELATIVE_KNEE        = 0.005f;
 static const float  NORMALIZED_DIST      = 3.5f;
-static const float  COLOR_SENSITIVITY    = 7.0f;   // edge-stop sensitivity in pass 2
+static const float  COLOR_SENSITIVITY    = 9.0f;   // REV 3: was 7.0 — reject low-contrast neighbors harder
 static const float  DIRECTION_ALIGNMENT_MIN = 0.7f;
 static const float  MIN_COHERENCE        = 0.08f;
 
@@ -92,10 +106,13 @@ static const float  OBLIQUE_5X5_BIAS     = 0.60f;
 static const float  KERNEL_MIX_LO        = 0.10f;
 static const float  KERNEL_MIX_HI        = 0.75f;
 
-// Temporal-stability damping (REV 2). No history buffer; uses consensus*coherence
-// as a proxy for how reliable the local estimate is, and softens the blend
-// delta on unreliable pixels.
-static const float  STABILITY_FLOOR      = 0.35f;
+// Temporal-stability damping (REV 2, tightened REV 3). No history buffer; uses
+// consensus*coherence as a proxy for how reliable the local estimate is, and
+// softens the blend delta on unreliable pixels.
+static const float  STABILITY_FLOOR      = 0.45f;  // REV 3: was 0.35
+
+// REV 3: normalized-AND soft knee for each gate.
+static const float  GATE_SOFT_KNEE       = 0.35f;
 
 #define RT_METRICS float4(BUFFER_RCP_WIDTH, BUFFER_RCP_HEIGHT, BUFFER_WIDTH, BUFFER_HEIGHT)
 #define LUM_WEIGHTS float3(0.2126f, 0.7152f, 0.0722f)
@@ -179,15 +196,16 @@ float max3(float3 v) { return max(v.x, max(v.y, v.z)); }
 
 static const float DEG2RAD = 0.017453292519943295f;
 
-// 5x5 iso-diamond radial weights (REV 2).
-// Indexed by rotated-lattice radius r in [0..2], where r = max(|row|,|col|)
-// in the rotated grid. Weight profile is a discrete Gaussian on the diamond:
-//   r=0: 1.0
-//   r=1: 0.55 (four diamond neighbors)
-//   r=2: 0.10 (outer diamond ring)
-// This removes the rotated-square bias of the previous separable binomial
-// product while keeping the low-noise derivative-of-Gaussian behavior.
-static const float DIAMOND_W[3] = { 1.0f, 0.55f, 0.10f };
+// 5x5 iso-diamond radial weights — 1,4,6,4,1 binomial profile by diamond ring (REV 4).
+// Mapping on the rotated lattice, where r = max(|row|,|col|) in rotated coords:
+//   r=0 (center)        -> binomial index 6 -> 6.0
+//   r=1 (4 diamond nbrs) -> binomial index 4 -> 4.0
+//   r=2 (outer ring)     -> binomial index 1 -> 1.0
+// Absolute scale is irrelevant: compute_all_tensors divides by totalWeight5,
+// so only the 6:4:1 ratio matters. This is the correct binomial coefficient
+// sequence for a 5-tap kernel and yields a proper separable derivative-of-
+// Gaussian on the rotated diamond.
+static const float DIAMOND_W[3] = { 6.0f, 4.0f, 1.0f };
 
 // 7x7 binomial stays separable/axis-aligned (it is a genuine separable grid).
 static const float KERNEL_7x7[7] = { 1.0f, 3.0f, 6.0f, 7.0f, 6.0f, 3.0f, 1.0f };
@@ -197,6 +215,8 @@ static const float KERNEL_7x7[7] = { 1.0f, 3.0f, 6.0f, 7.0f, 6.0f, 3.0f, 1.0f };
 // Gate 1: distance-2 color jump in 8 directions
 // Gate 2: 1px axial color jump
 // Gate 3: 1px diagonal color jump
+// REV 3: amplitude-normalized AND + directional-consistency rescue for
+//        low-contrast stair-steps (no noise/thickness increase).
 // =============================================================================
 float fast_edge_consensus(float2 tex, float2 offset, float3 centerColor)
 {
@@ -271,16 +291,38 @@ float fast_edge_consensus(float2 tex, float2 offset, float3 centerColor)
 	float edge3 = saturate(diagJump  * JUMP_GAIN_EDGE);
 
 	// =====================================================================
-	// AND-gate consensus
+	// AND-gate consensus — amplitude-normalized (REV 3)
+	// Each gate re-expressed as "how step-like is this" in [0,1] with a
+	// soft knee, independent of absolute contrast. The product then means
+	// "all three scales agree this is a step", not "the step is bright".
 	// =====================================================================
-	float consensus = edge1 * edge2 * edge3;
-	float threshold = CONSENSUS_THRESHOLD * CONSENSUS_THRESHOLD * CONSENSUS_THRESHOLD;
+	float e1 = smoothstep(0.0f, GATE_SOFT_KNEE, edge1);
+	float e2 = smoothstep(0.0f, GATE_SOFT_KNEE, edge2);
+	float e3 = smoothstep(0.0f, GATE_SOFT_KNEE, edge3);
+
+	float consensus = e1 * e2 * e3;
+	float threshold = 0.15f; // was CONSENSUS_THRESHOLD^3 (= 0.216)
 	consensus = smoothstep(threshold * 0.5f, threshold * 1.5f, consensus);
 
 	float minEdge = max(edge1, max(edge2, edge3));
 	consensus *= smoothstep(MIN_CONSENSUS_EDGE * 0.5f, MIN_CONSENSUS_EDGE * 1.5f, minEdge);
 
-	return consensus;
+	// =====================================================================
+	// REV 3: Directional-consistency rescue for low-contrast stair-steps.
+	// A stair-step has its strongest 1px jump concentrated on ONE side of
+	// the step (axial), and a correlated diagonal; noise spreads across all
+	// eight. Measure axial concentration and rescue ONLY when Gate 1 is
+	// weak (low contrast) and the geometry is genuinely step-like.
+	// =====================================================================
+	float axMax = max(max(axN, axS), max(axE, axW));
+	float axMin = min(min(axN, axS), min(axE, axW));
+	float axConcentration = (axMax > 1e-5f) ? (1.0f - axMin / axMax) : 0.0f;
+
+	float weakGateRescue = smoothstep(0.0f, 1.0f, axConcentration)
+	                     * (1.0f - smoothstep(0.2f, 0.6f, edge1)); // only when Gate1 is weak
+	consensus = max(consensus, weakGateRescue * e2 * e3 * 0.85f);
+
+	return saturate(consensus);
 }
 
 // =============================================================================
@@ -294,7 +336,7 @@ void compute_all_tensors(
 	out float3 gx5, out float3 gy5,
 	out float3 gx7, out float3 gy7)
 {
-	// 5x5 rotated body — ISO-DIAMOND radial weights (REV 2).
+	// 5x5 rotated body — ISO-DIAMOND radial weights, 1,4,6,4,1 by ring (REV 4).
 	gx5 = float3(0.0f, 0.0f, 0.0f);
 	gy5 = float3(0.0f, 0.0f, 0.0f);
 	float totalWeight5 = 0.0f;
